@@ -1,8 +1,7 @@
 import Foundation
 import Synchronization
 import Testing
-import ZIPFoundation
-import ZipMello
+@testable import ZipMello
 import ZipMelloConsumers
 
 private final class ConsumerWorkspace: Sendable {
@@ -13,15 +12,21 @@ private final class ConsumerWorkspace: Sendable {
     }
     deinit { try? FileManager.default.removeItem(at: root) }
     func file(_ path: String) -> URL { root.appendingPathComponent(path) }
-    func upstream(_ paths: [String], bytes: Data = Data("payload".utf8)) throws -> URL {
+    func upstream(_ paths: [String], bytes: Data = Data("payload".utf8)) async throws -> URL {
         let url = file(UUID().uuidString + ".zip")
-        let archive = try Archive(url: url, accessMode: .create)
-        for path in paths {
-            try archive.addEntry(with: path, type: path.hasSuffix("/") ? .directory : .file,
-                                 uncompressedSize: path.hasSuffix("/") ? Int64(0) : Int64(bytes.count)) { offset, size in
-                bytes.subdata(in: Int(offset)..<(Int(offset) + size))
+        let assets = paths.map { path -> ArchiveAsset in
+            if path.hasSuffix("/") {
+                return ArchiveAsset(path: path, content: .directory)
+            } else {
+                return ArchiveAsset(path: path, content: .bytes(bytes))
             }
         }
+        let sizes = assets.map { asset -> UInt64 in
+            if case .directory = asset.content { return 0 } else { return UInt64(bytes.count) }
+        }
+        let total = sizes.reduce(0, +)
+        FileManager.default.createFile(atPath: url.path, contents: nil)
+        try ZipBinaryWriter.writeArchive(to: url, assets: assets, sizes: sizes, limits: .init(), tuning: .init(), progress: nil, totalBytes: total)
         return url
     }
 }
@@ -61,7 +66,7 @@ private final class ConsumerWorkspace: Sendable {
 
     @Test func `Compatible lookup resolves aliases and prefers exact paths`() async throws {
         let work = try ConsumerWorkspace()
-        let url = try work.upstream(["./OEBPS/images/plate%20one.png", "OEBPS/Cover.PNG"])
+        let url = try await work.upstream(["./OEBPS/images/plate%20one.png", "OEBPS/Cover.PNG"])
         let reader = try await ArchiveReader.open(url)
         #expect(try await reader.read("oebps/images/plate one.png", lookup: .compatible) == Data("payload".utf8))
         #expect(try ArchiveMemoryReader(data: Data(contentsOf: url), lookup: .compatible).read("oebps/images/plate one.png") == Data("payload".utf8))
@@ -72,7 +77,7 @@ private final class ConsumerWorkspace: Sendable {
 
     @Test func `Ambiguous aliases fail while exact names remain readable`() async throws {
         let work = try ConsumerWorkspace()
-        let url = try work.upstream(["Cover.PNG", "cover.png", "safe%2F..%2Fescape"])
+        let url = try await work.upstream(["Cover.PNG", "cover.png", "safe%2F..%2Fescape"])
         let reader = try await ArchiveReader.open(url)
         await #expect(throws: ArchiveFailure.ambiguousEntry("COVER.PNG")) { try await reader.read("COVER.PNG", lookup: .compatible) }
         #expect(try await reader.read("cover.png", lookup: .compatible) == Data("payload".utf8))
@@ -82,7 +87,7 @@ private final class ConsumerWorkspace: Sendable {
 
     @Test func `Tree extraction handles Payload and empty directories`() async throws {
         let work = try ConsumerWorkspace()
-        let url = try work.upstream(["./", "./Payload/source.json", "Payload/nested/main.wasm", "empty/"])
+        let url = try await work.upstream(["./", "./Payload/source.json", "Payload/nested/main.wasm", "empty/"])
         let reader = try await ArchiveReader.open(url)
         let events = Mutex<[ArchiveProgress]>([])
         try await reader.extractAll(to: work.file("installed")) { event in events.withLock { $0.append(event) } }
@@ -95,7 +100,7 @@ private final class ConsumerWorkspace: Sendable {
     @Test(arguments: [["A/page", "a/page"], ["file", "file/page"], ["./page", "page"], ["é/page", "e\u{301}/page"]])
     func `Tree collisions never publish`(paths: [String]) async throws {
         let work = try ConsumerWorkspace()
-        let url = try work.upstream(paths)
+        let url = try await work.upstream(paths)
         await #expect(throws: (any Error).self) {
             let reader = try await ArchiveReader.open(url)
             try await reader.extractAll(to: work.file("bad"))
@@ -106,7 +111,7 @@ private final class ConsumerWorkspace: Sendable {
 
     @Test func `CRC preflight and tree extraction reject corrupted payloads`() async throws {
         let work = try ConsumerWorkspace(), bytes = Data("unique-crc-payload".utf8)
-        let url = try work.upstream(["nested/page"], bytes: bytes)
+        let url = try await work.upstream(["nested/page"], bytes: bytes)
         var zip = try Data(contentsOf: url)
         let range = try #require(zip.range(of: bytes)); zip[range.lowerBound] ^= 1; try zip.write(to: url)
         let reader = try await ArchiveReader.open(url)
@@ -117,7 +122,7 @@ private final class ConsumerWorkspace: Sendable {
 
     @Test func `Cancellation during tree progress removes partial files`() async throws {
         let work = try ConsumerWorkspace()
-        let reader = try await ArchiveReader.open(work.upstream(["one", "two"]))
+        let reader = try await ArchiveReader.open(await work.upstream(["one", "two"]))
         let task = Task {
             try await reader.extractAll(to: work.file("cancelled")) { progress in
                 if progress.completedEntries == 1 { withUnsafeCurrentTask { $0?.cancel() } }
@@ -136,13 +141,13 @@ private final class ConsumerWorkspace: Sendable {
         }
         let events = Mutex<[ArchiveProgress]>([])
         try await ArchiveWriter().create(at: work.file("chapter.cbz"), directory: source) { event in events.withLock { $0.append(event) } }
-        let archive = try Archive(url: work.file("chapter.cbz"), accessMode: .read)
-        #expect(archive["nested/empty/"]?.type == .directory)
-        #expect(archive["source/1.png"] == nil)
-        #expect(archive[".metadata.json"] != nil)
-        let paths = archive.map(\.path)
-        #expect(try #require(paths.firstIndex(of: "2.png")) < #require(paths.firstIndex(of: "10.png")))
         let reader = try await ArchiveReader.open(work.file("chapter.cbz"))
+        let members = try await reader.listing()
+        #expect(members.first(where: { $0.path == "nested/empty" || $0.path == "nested/empty/" })?.isDirectory == true)
+        #expect(members.first(where: { $0.path == "source/1.png" }) == nil)
+        #expect(members.first(where: { $0.path == ".metadata.json" }) != nil)
+        let paths = members.map(\.path)
+        #expect(try #require(paths.firstIndex(of: "2.png")) < #require(paths.firstIndex(of: "10.png")))
         #expect(try await reader.read("2.desc.txt") == Data("2.desc.txt".utf8))
         let values = events.withLock { $0 }
         #expect(values.last?.completedBytes == values.last?.totalBytes)

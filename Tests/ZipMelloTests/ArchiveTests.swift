@@ -1,6 +1,5 @@
 import Foundation
 import Testing
-import ZIPFoundation
 @testable import ZipMello
 
 private final class Workspace: Sendable {
@@ -47,22 +46,50 @@ struct ArchiveTests {
     @Test
     func rejectsUntrustedTraversalOnOpen() async throws {
         let work = try Workspace()
-        do {
-            let archive = try Archive(url: work.file("bad.zip"), accessMode: .create)
-            try archive.addEntry(with: "../escape", type: .file, uncompressedSize: Int64(1)) { _, _ in Data([1]) }
-        }
-        await #expect(throws: ArchiveFailure.unsafePath("../escape")) { try await ArchiveReader.open(work.file("bad.zip")) }
+        let file = work.file("bad.zip")
+        FileManager.default.createFile(atPath: file.path, contents: nil)
+        try ZipBinaryWriter.writeArchive(to: file, assets: [.init(path: "../escape", content: .bytes(Data([1])))], sizes: [1], limits: .init(), tuning: .init(), progress: nil, totalBytes: 1)
+        await #expect(throws: ArchiveFailure.unsafePath("../escape")) { try await ArchiveReader.open(file) }
     }
 
     @Test
     func rejectsSymlinksOnOpen() async throws {
         let work = try Workspace()
-        do {
-            let archive = try Archive(url: work.file("link.zip"), accessMode: .create)
-            let target = Data("../escape".utf8)
-            try archive.addEntry(with: "link", type: .symlink, uncompressedSize: Int64(target.count)) { _, _ in target }
+        let file = work.file("link.zip")
+        let nameData = Data("link".utf8)
+        var data = Data()
+        var lh = Data(count: 30 + nameData.count)
+        lh.withUnsafeMutableBytes { buf in
+            ZipBinaryBuffer.writeUInt32(ZipMagic.localHeader, into: buf, offset: 0)
+            ZipBinaryBuffer.writeUInt16(20, into: buf, offset: 4)
+            ZipBinaryBuffer.writeUInt16(UInt16(nameData.count), into: buf, offset: 26)
         }
-        await #expect(throws: ArchiveFailure.unsupportedEntry("link")) { try await ArchiveReader.open(work.file("link.zip")) }
+        lh.replaceSubrange(30..<30+nameData.count, with: nameData)
+        data.append(lh)
+        let cdOffset = UInt64(data.count)
+        var cd = Data(count: 46 + nameData.count)
+        cd.withUnsafeMutableBytes { buf in
+            ZipBinaryBuffer.writeUInt32(ZipMagic.centralDirectoryHeader, into: buf, offset: 0)
+            ZipBinaryBuffer.writeUInt16(20, into: buf, offset: 4)
+            ZipBinaryBuffer.writeUInt16(20, into: buf, offset: 6)
+            ZipBinaryBuffer.writeUInt16(UInt16(nameData.count), into: buf, offset: 28)
+            ZipBinaryBuffer.writeUInt32(0xA1FF0000, into: buf, offset: 38)
+            ZipBinaryBuffer.writeUInt32(0, into: buf, offset: 42)
+        }
+        cd.replaceSubrange(46..<46+nameData.count, with: nameData)
+        data.append(cd)
+        let cdSize = UInt64(cd.count)
+        var eocd = Data(count: 22)
+        eocd.withUnsafeMutableBytes { buf in
+            ZipBinaryBuffer.writeUInt32(ZipMagic.endOfCentralDirectory, into: buf, offset: 0)
+            ZipBinaryBuffer.writeUInt16(1, into: buf, offset: 8)
+            ZipBinaryBuffer.writeUInt16(1, into: buf, offset: 10)
+            ZipBinaryBuffer.writeUInt32(UInt32(cdSize), into: buf, offset: 12)
+            ZipBinaryBuffer.writeUInt32(UInt32(cdOffset), into: buf, offset: 16)
+        }
+        data.append(eocd)
+        try data.write(to: file)
+        await #expect(throws: ArchiveFailure.unsupportedEntry("link")) { try await ArchiveReader.open(file) }
     }
 
     @Test
@@ -114,11 +141,10 @@ struct ArchiveTests {
         await #expect(throws: ArchiveFailure.duplicatePath("page")) {
             try await ArchiveWriter().create(at: work.file("bad.zip"), assets: [asset, asset])
         }
-        do {
-            let archive = try Archive(url: work.file("duplicate.zip"), accessMode: .create)
-            for _ in 0..<2 { try archive.addEntry(with: "page", type: .file, uncompressedSize: Int64(0)) { _, _ in Data() } }
-        }
-        await #expect(throws: ArchiveFailure.duplicatePath("page")) { try await ArchiveReader.open(work.file("duplicate.zip")) }
+        let dupFile = work.file("duplicate.zip")
+        FileManager.default.createFile(atPath: dupFile.path, contents: nil)
+        try ZipBinaryWriter.writeArchive(to: dupFile, assets: [asset, asset], sizes: [0, 0], limits: .init(), tuning: .init(), progress: nil, totalBytes: 0)
+        await #expect(throws: ArchiveFailure.duplicatePath("page")) { try await ArchiveReader.open(dupFile) }
         try await ArchiveWriter().create(at: work.file("valid.zip"), assets: [asset])
         let reader = try await ArchiveReader.open(work.file("valid.zip"))
         await #expect(throws: ArchiveFailure.missingEntry("absent")) { try await reader.read("absent") }
@@ -266,18 +292,13 @@ extension ArchiveTests {
     }
 
     @Test
-    func bulkWriterEmitsZIP64DirectoryForLargeEntryCount() throws {
+    func bulkWriterEmitsZIP64DirectoryForLargeEntryCount() async throws {
         let work = try Workspace()
-        do {
-            let writer = try BulkArchiveWriter(url: work.file("zip64.zip"), maximumBytes: 20_000_000)
-            for index in 0..<65_536 {
-                try writer.append(path: "\(index)", size: 0, deflate: false, bufferSize: 65_536) { _, _ in Data() }
-            }
-            try writer.finish()
-        }
-        let archive = try Archive(url: work.file("zip64.zip"), accessMode: .read)
-        #expect(archive.declaredEntryCount == 65_536)
-        #expect(Array(archive).count == 65_536)
+        let assets = (0..<65_536).map { ArchiveAsset(path: "\($0)", content: .bytes(Data())) }
+        try await ArchiveWriter().create(at: work.file("zip64.zip"), assets: assets, limits: .init(maximumEntries: 70_000))
+        let reader = try await ArchiveReader.open(work.file("zip64.zip"), limits: .init(maximumEntries: 70_000))
+        #expect(try await reader.listing().count == 65_536)
+        await reader.close()
     }
 
     @Test

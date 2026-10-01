@@ -21,6 +21,25 @@ public enum ArchiveFailure: Error, Equatable, Sendable {
     case invalidSource(String)
 }
 
+/// Immutable metadata for an indexed member read operation.
+public struct ArchiveReadDescriptor: Sendable {
+    public let offset: UInt64
+    public let compressedBytes: UInt64
+    public let expandedBytes: UInt64
+    public let checksum: UInt32
+    public let compression: ArchiveCompression
+
+    public var isDeflated: Bool { compression == .deflate }
+
+    public init(offset: UInt64, compressedBytes: UInt64, expandedBytes: UInt64, checksum: UInt32, compression: ArchiveCompression) {
+        self.offset = offset
+        self.compressedBytes = compressedBytes
+        self.expandedBytes = expandedBytes
+        self.checksum = checksum
+        self.compression = compression
+    }
+}
+
 /// Budgets apply both to declared sizes and bytes actually emitted by extraction.
 public struct ArchiveLimits: Sendable {
     public var maximumArchiveBytes: UInt64

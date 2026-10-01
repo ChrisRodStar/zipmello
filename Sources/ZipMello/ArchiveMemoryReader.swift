@@ -1,6 +1,5 @@
 import Foundation
 import Dispatch
-import ZIPFoundation
 
 /// Immutable byte-backed index for batch reads without actor hops between members.
 /// Call from a bounded archive worker; initialization/extraction are synchronous.
@@ -8,14 +7,18 @@ public struct ArchiveMemoryReader: Sendable {
     private let validated: ValidatedArchiveIndex
     private let worker: ArchiveReadWorker
     private let lookup: ArchiveLookup
+
     public init(data: Data, limits: ArchiveLimits = .init(), tuning: ArchiveTuning = .init(), lookup: ArchiveLookup = .exact) throws {
         try limits.validate(); try tuning.validate(); try Task.checkCancellation()
         guard UInt64(data.count) <= limits.maximumArchiveBytes else { throw ArchiveFailure.archiveTooLarge }
-        validated = try ValidatedArchiveIndex(Archive(data: data, accessMode: .read), bytes: UInt64(data.count), limits: limits)
+        let parser = try ZipCentralDirectoryParser.parse(input: .bytes(data))
+        validated = try ValidatedArchiveIndex(parser: parser, input: .bytes(data), bytes: UInt64(data.count), limits: limits)
         worker = ArchiveReadWorker(input: .bytes(data), limits: limits, tuning: tuning)
         self.lookup = lookup
     }
+
     public func listing() -> [ArchiveMember] { validated.members }
+
     public func read(_ path: String) throws -> Data {
         try Task.checkCancellation()
         var resolved = path

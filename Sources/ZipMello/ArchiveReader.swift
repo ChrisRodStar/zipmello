@@ -2,7 +2,6 @@ import Foundation
 import Dispatch
 import SystemPackage
 import Darwin
-import ZIPFoundation
 
 /// One immutable file descriptor, closed after the last extraction lane releases it.
 final class ArchiveFile: Sendable {
@@ -16,6 +15,7 @@ final class ArchiveFile: Sendable {
     let modifiedNanoseconds: Int
     let changedSeconds: Int
     let changedNanoseconds: Int
+
     init(_ url: URL, bypassFileCache: Bool) throws {
         let descriptor = try FileDescriptor.open(url.path, .readOnly, options: [.noFollow])
         if bypassFileCache, fcntl(descriptor.rawValue, F_NOCACHE, 1) != 0 {
@@ -51,6 +51,7 @@ final class ArchiveFile: Sendable {
             }
         }
     }
+
     func read(offset: UInt64, count: Int) throws -> Data {
         guard count >= 0, offset <= bytes, UInt64(count) <= bytes - offset else {
             throw ArchiveFailure.invalidSource("Entry extends beyond archive")
@@ -101,12 +102,14 @@ struct ArchiveReadWorker: Sendable {
         self.input = input; self.limits = limits; self.tuning = tuning
     }
     func validateIdentity() throws { try input.validateIdentity() }
+
     func read(_ entry: ArchiveReadDescriptor, path: String) throws -> Data {
         var output = Data()
         output.reserveCapacity(Int(entry.expandedBytes))
         try consume(entry, path: path) { output.append($0) }
         return output
     }
+
     func extract(_ entry: ArchiveReadDescriptor, path: String, to destination: URL, durability: ArchiveDurability) throws {
         try Task.checkCancellation()
         guard destination.isFileURL else { throw ArchiveFailure.invalidSource(destination.absoluteString) }
@@ -125,19 +128,44 @@ struct ArchiveReadWorker: Sendable {
         try Task.checkCancellation()
         try fm.moveItem(at: staging, to: destination)
     }
+
     func consume(_ entry: ArchiveReadDescriptor, path: String, consumer: (Data) throws -> Void) throws {
         try Task.checkCancellation()
         var emitted: UInt64 = 0
-        let crc = try Archive.extract(entry, bufferSize: limits.bufferBytes,
-              wholeBufferLimit: tuning.wholeBufferDeflateLimit, provider: { offset, count in
-            try self.input.read(offset: entry.offset + UInt64(offset), count: count)
-        }) { chunk in
-            try Task.checkCancellation()
-            let sum = emitted.addingReportingOverflow(UInt64(chunk.count))
-            guard !sum.overflow, sum.partialValue <= entry.expandedBytes,
-                  sum.partialValue <= limits.maximumEntryBytes else { throw ArchiveFailure.memberTooLarge(path) }
-            emitted = sum.partialValue
-            try consumer(chunk)
+        let crc: UInt32
+        if entry.compression == .deflate {
+            crc = try ZipDeflateEngine.decompress(
+                compressedBytes: entry.compressedBytes,
+                bufferBytes: limits.bufferBytes,
+                provider: { offset, count in
+                    try self.input.read(offset: entry.offset + offset, count: count)
+                },
+                consumer: { chunk in
+                    try Task.checkCancellation()
+                    let sum = emitted.addingReportingOverflow(UInt64(chunk.count))
+                    guard !sum.overflow, sum.partialValue <= entry.expandedBytes,
+                          sum.partialValue <= limits.maximumEntryBytes else { throw ArchiveFailure.memberTooLarge(path) }
+                    emitted = sum.partialValue
+                    try consumer(chunk)
+                }
+            )
+        } else {
+            var readOffset: UInt64 = 0
+            var runningCRC: UInt32 = 0
+            while readOffset < entry.compressedBytes {
+                try Task.checkCancellation()
+                let fetchCount = Int(Swift.min(UInt64(limits.bufferBytes), entry.compressedBytes - readOffset))
+                let chunk = try self.input.read(offset: entry.offset + readOffset, count: fetchCount)
+                guard !chunk.isEmpty else { break }
+                readOffset += UInt64(chunk.count)
+                let sum = emitted.addingReportingOverflow(UInt64(chunk.count))
+                guard !sum.overflow, sum.partialValue <= entry.expandedBytes,
+                      sum.partialValue <= limits.maximumEntryBytes else { throw ArchiveFailure.memberTooLarge(path) }
+                emitted = sum.partialValue
+                runningCRC = ZipChecksum.update(current: runningCRC, data: chunk)
+                try consumer(chunk)
+            }
+            crc = runningCRC
         }
         guard emitted == entry.expandedBytes else { throw ArchiveFailure.sizeMismatch(path) }
         guard crc == entry.checksum else { throw ArchiveFailure.checksumMismatch(path) }
@@ -188,8 +216,8 @@ public actor ArchiveReader {
         let file = try ArchiveFile(url, bypassFileCache: tuning.bypassFileCache)
         guard file.bytes <= limits.maximumArchiveBytes else { throw ArchiveFailure.archiveTooLarge }
         try file.validateIdentity(at: url)
-        let opened = try Archive(url: url, accessMode: .read)
-        try loadIndex(opened, input: .file(file))
+        let parser = try ZipCentralDirectoryParser.parse(input: .file(file))
+        try loadIndex(parser, input: .file(file))
         try file.validateIdentity(at: url)
     }
 
@@ -201,13 +229,15 @@ public actor ArchiveReader {
         try await reader.load(data)
         return reader
     }
+
     private func load(_ data: Data) throws {
         try Task.checkCancellation()
-        let opened = try Archive(data: data, accessMode: .read)
-        try loadIndex(opened, input: .bytes(data))
+        let parser = try ZipCentralDirectoryParser.parse(input: .bytes(data))
+        try loadIndex(parser, input: .bytes(data))
     }
-    private func loadIndex(_ opened: Archive, input: ArchiveInput) throws {
-        let validated = try ValidatedArchiveIndex(opened, bytes: input.count, limits: limits)
+
+    private func loadIndex(_ parser: ZipCentralDirectoryParser, input: ArchiveInput) throws {
+        let validated = try ValidatedArchiveIndex(parser: parser, input: input, bytes: input.count, limits: limits)
         index = validated.index; members = validated.members
         let worker = ArchiveReadWorker(input: input, limits: limits, tuning: tuning)
         self.worker = worker
@@ -219,16 +249,19 @@ public actor ArchiveReader {
         guard !lanes.isEmpty else { throw ArchiveFailure.closed }
         return members
     }
+
     public func read(_ path: String, lookup: ArchiveLookup = .exact) async throws -> Data {
         let (entry, lane) = try select(path, lookup: lookup)
         if let inlineWorker { return try inlineWorker.read(entry, path: path) }
         return try await lane.read(entry, path: path)
     }
+
     public func extract(_ path: String, to destination: URL, lookup: ArchiveLookup = .exact, durability: ArchiveDurability = .synchronized) async throws {
         let (entry, lane) = try select(path, lookup: lookup)
         if let inlineWorker { try inlineWorker.extract(entry, path: path, to: destination, durability: durability); return }
         try await lane.extract(entry, path: path, to: destination, durability: durability)
     }
+
     /// Streams expanded bytes. Successful return guarantees exact size and CRC; callbacks may
     /// receive unverified chunks before return, so consumers must stage irreversible effects.
     public func consume(_ path: String, lookup: ArchiveLookup = .exact,
@@ -242,6 +275,7 @@ public actor ArchiveReader {
         guard let worker else { throw ArchiveFailure.closed }
         try worker.validateIdentity()
     }
+
     public func validate(progress: ArchiveProgressHandler? = nil) throws {
         try Task.checkCancellation()
         guard let worker else { throw ArchiveFailure.closed }
@@ -350,6 +384,7 @@ public actor ArchiveReader {
         nextLane = (nextLane + 1) % lanes.count
         return (entry, lane)
     }
+
     /// Already accepted reads keep their descriptor alive until completion.
     public func close() { worker = nil; aliases.removeAll(); ambiguousAliases.removeAll(); aliasesReady = false; inlineWorker = nil; lanes.removeAll(); index.removeAll(); members.removeAll() }
 }

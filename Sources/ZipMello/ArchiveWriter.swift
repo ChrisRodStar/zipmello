@@ -2,7 +2,6 @@ import Foundation
 import Dispatch
 import Darwin
 import SystemPackage
-import ZIPFoundation
 
 public actor ArchiveWriter {
     private nonisolated let executor = DispatchSerialQueue(label: "ZipMello.writer", qos: .utility)
@@ -49,8 +48,10 @@ public actor ArchiveWriter {
         })
         let staging = destination.deletingLastPathComponent().appendingPathComponent(".archive-" + UUID().uuidString)
         defer { try? fm.removeItem(at: staging) }
-        do { try writeStaging(staging, assets: assets, sizes: sizes, limits: limits, tuning: tuning, progress: progress, total: total) }
-        catch Archive.ArchiveError.invalidEntrySize { throw ArchiveFailure.archiveTooLarge }
+
+        fm.createFile(atPath: staging.path, contents: nil)
+        try writeStaging(staging, assets: assets, sizes: sizes, limits: limits, tuning: tuning, progress: progress, total: total)
+
         try Task.checkCancellation()
         let handle = try FileHandle(forWritingTo: staging)
         do { try handle.synchronize(); try handle.close() }
@@ -59,70 +60,15 @@ public actor ArchiveWriter {
     }
 
     private func writeStaging(_ staging: URL, assets: [ArchiveAsset], sizes: [UInt64], limits: ArchiveLimits, tuning: ArchiveTuning, progress: ArchiveProgressHandler?, total: UInt64) throws {
-        let archive = try BulkArchiveWriter(url: staging, maximumBytes: limits.maximumArchiveBytes)
-        var completed: UInt64 = 0
-        var entryNumber = 0
-        progress?(.init(completedBytes: 0, totalBytes: total, completedEntries: 0, totalEntries: assets.count))
-        for (asset, size) in zip(assets, sizes) {
-            try Task.checkCancellation()
-            let handle: FileDescriptor?
-            var initial = stat()
-            if case .file(let url) = asset.content {
-                let descriptor = try FileDescriptor.open(url.path, .readOnly, options: [.noFollow])
-                guard fstat(descriptor.rawValue, &initial) == 0, initial.st_mode & S_IFMT == S_IFREG,
-                      initial.st_size >= 0, UInt64(initial.st_size) == size else {
-                    try? descriptor.close()
-                    throw ArchiveFailure.invalidSource(asset.path)
-                }
-                handle = descriptor
-            }
-            else { handle = nil }
-            defer { try? handle?.close() }
-            let directory: Bool
-            if case .directory = asset.content { directory = true } else { directory = false }
-            let path = directory && !asset.path.hasSuffix("/") ? asset.path + "/" : asset.path
-            try archive.append(path: path, size: Int64(size), deflate: !directory && asset.compression == .deflate,
-                                  bufferSize: limits.bufferBytes, wholeBufferLimit: tuning.wholeBufferDeflateLimit, isDirectory: directory) { offset, count in
-                try Task.checkCancellation()
-                let chunk: Data
-                switch asset.content {
-                case .directory: chunk = Data()
-                case .bytes(let data): chunk = data.subdata(in: Int(offset)..<(Int(offset) + count))
-                case .file:
-                    guard let handle else { throw ArchiveFailure.invalidSource(asset.path) }
-                    var bytes = Data(count: count)
-                    try bytes.withUnsafeMutableBytes { target in
-                        var completed = 0
-                        while completed < count {
-                            try Task.checkCancellation()
-                            let amount = try handle.read(into: .init(rebasing: target[completed...]))
-                            guard amount > 0 else { throw ArchiveFailure.sizeMismatch(asset.path) }
-                            completed += amount
-                        }
-                    }
-                    chunk = bytes
-                }
-                guard chunk.count == count else { throw ArchiveFailure.sizeMismatch(asset.path) }
-                progress?(.init(completedBytes: completed + UInt64(offset) + UInt64(count), totalBytes: total,
-                                completedEntries: entryNumber, totalEntries: assets.count))
-                return chunk
-            }
-            if let handle {
-                var final = stat()
-                guard fstat(handle.rawValue, &final) == 0, final.st_size == initial.st_size,
-                      final.st_mtimespec.tv_sec == initial.st_mtimespec.tv_sec,
-                      final.st_mtimespec.tv_nsec == initial.st_mtimespec.tv_nsec,
-                      final.st_ctimespec.tv_sec == initial.st_ctimespec.tv_sec,
-                      final.st_ctimespec.tv_nsec == initial.st_ctimespec.tv_nsec else {
-                    throw ArchiveFailure.invalidSource(asset.path)
-                }
-            }
-            try checkOutputSize(staging, limits: limits)
-            completed += size; entryNumber += 1
-            progress?(.init(completedBytes: completed, totalBytes: total, completedEntries: entryNumber, totalEntries: assets.count))
-        }
-        do { try archive.finish() }
-        catch Archive.ArchiveError.invalidEntrySize { throw ArchiveFailure.archiveTooLarge }
+        try ZipBinaryWriter.writeArchive(
+            to: staging,
+            assets: assets,
+            sizes: sizes,
+            limits: limits,
+            tuning: tuning,
+            progress: progress,
+            totalBytes: total
+        )
         try checkOutputSize(staging, limits: limits)
     }
 
