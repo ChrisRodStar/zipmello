@@ -1,0 +1,6 @@
+[submodule "Reference/ZIPFoundation"]
+	path = Benchmarks/Reference/ZIPFoundation
+	url = https://github.com/weichsel/ZIPFoundation.git
+[submodule "Reference/libdeflate"]
+	path = Benchmarks/Reference/libdeflate
+	url = https://github.com/ebiggers/libdeflate.git

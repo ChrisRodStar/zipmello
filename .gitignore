@@ -1,0 +1,8 @@
+.build*/
+.swiftpm/
+.DS_Store
+
+# Local developer tools and benchmark suites (preserved locally, untracked on GitHub)
+Benchmarks/
+Tools/
+
