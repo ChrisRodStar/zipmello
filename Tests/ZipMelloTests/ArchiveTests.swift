@@ -334,4 +334,56 @@ extension ArchiveTests {
         try await ArchiveReader.extractAll(from: zipURL, to: folderURL)
         #expect(try Data(contentsOf: folderURL.appendingPathComponent("test.txt")) == assetData)
     }
+
+    @Test
+    func deflateStreamTerminationWithTrailingInput() throws {
+        let original = Data("payload data to be compressed and tested with trailing bytes".utf8)
+        var compressed = Data()
+        _ = try ZipDeflateEngine.compress(
+            uncompressedBytes: UInt64(original.count),
+            provider: { offset, count in original.subdata(in: Int(offset)..<(Int(offset) + count)) },
+            consumer: { compressed.append($0) }
+        )
+        // Append extra trailing junk bytes simulating extra unconsumed provider buffer
+        var padded = compressed
+        padded.append(contentsOf: [0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x01, 0x02, 0x03])
+
+        var decompressed = Data()
+        let crc = try ZipDeflateEngine.decompress(
+            compressedBytes: UInt64(padded.count),
+            provider: { offset, count in
+                let start = Int(offset)
+                let end = Swift.min(start + count, padded.count)
+                guard start < end else { return Data() }
+                return padded.subdata(in: start..<end)
+            },
+            consumer: { decompressed.append($0) }
+        )
+        #expect(decompressed == original)
+        #expect(crc == ZipChecksum.update(data: original))
+    }
+
+    @Test
+    func eocdParsesArchiveWithComment() async throws {
+        let work = try Workspace()
+        let file = work.file("commented.zip")
+        try await ArchiveWriter().create(at: file, assets: [
+            .init(path: "item.txt", content: .bytes(Data("sample".utf8)))
+        ])
+        // Append a zip comment to the EOCD record
+        var fileData = try Data(contentsOf: file)
+        let comment = Data("Hello ZIP comment".utf8)
+        let count = fileData.count
+        fileData.withUnsafeMutableBytes { ptr in
+            ZipBinaryBuffer.writeUInt16(UInt16(comment.count), into: ptr, offset: count - 2)
+        }
+        fileData.append(comment)
+        try fileData.write(to: file)
+
+        let reader = try await ArchiveReader.open(file)
+        #expect(try await reader.listing().map(\.path) == ["item.txt"])
+        #expect(try await reader.read("item.txt") == Data("sample".utf8))
+        await reader.close()
+    }
 }
+

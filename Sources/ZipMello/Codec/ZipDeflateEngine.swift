@@ -32,7 +32,9 @@ enum ZipDeflateEngine {
         var readPosition: UInt64 = 0
         var currentInputChunk: Data?
 
-        while true {
+        var streamFinished = false
+
+        while !streamFinished {
             if strm.avail_in == 0 && readPosition < compressedBytes {
                 let remaining = compressedBytes - readPosition
                 let fetchCount = Int(Swift.min(UInt64(bufferBytes), remaining))
@@ -78,9 +80,12 @@ enum ZipDeflateEngine {
                 }
 
                 if res == Z_STREAM_END {
+                    streamFinished = true
                     return
                 }
             }
+
+            if streamFinished { break }
 
             if strm.avail_in == 0 && readPosition >= compressedBytes {
                 break
@@ -114,8 +119,9 @@ enum ZipDeflateEngine {
 
         var readPosition: UInt64 = 0
         var currentInputChunk: Data?
+        var streamFinished = false
 
-        while true {
+        while !streamFinished {
             if strm.avail_in == 0 && readPosition < uncompressedBytes {
                 let remaining = uncompressedBytes - readPosition
                 let fetchCount = Int(Swift.min(UInt64(bufferBytes), remaining))
@@ -154,9 +160,11 @@ enum ZipDeflateEngine {
                     }
 
                     if res == Z_STREAM_END {
+                        streamFinished = true
                         return
                     }
                 }
+                if streamFinished { break }
             } else {
                 strm.next_out = outBuffer
                 strm.avail_out = uInt(bufferBytes)
