@@ -1,6 +1,6 @@
 # Architecture & Engine Design
 
-ZipMello is engineered for high performance, memory efficiency, and thread safety on Apple platforms. It requires zero third-party dependencies.
+ZipMello is engineered for high performance, memory efficiency, and thread safety on Apple platforms.
 
 ---
 
