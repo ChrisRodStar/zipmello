@@ -1,11 +1,8 @@
 .build*/
 .swiftpm/
 .DS_Store
-Benchmarks/.build*/
-Benchmarks/.swiftpm/
-Benchmarks/Fixtures/model/
-Benchmarks/Fixtures/comic128/
-Benchmarks/Fixtures/dictionary4000/
-Benchmarks/Fixtures/*.zip
-Benchmarks/results/sample.json
-Benchmarks/results/run.json
+
+# Local developer tools and benchmark suites (preserved locally, untracked on GitHub)
+Benchmarks/
+Tools/
+
