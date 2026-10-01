@@ -5,5 +5,5 @@
 3. Extend the external writer/fuzz corpus, including large ZIP64 offsets/sizes, filesystem races and mid-flight cancellation/teardown under prolonged load. Current tests cover streamed signed/unsigned descriptors, local ZIP64 reservation, zero ZIP64 central values, UTF-8/CP437 paths, CRC/budgets/collisions, and consumer flows.
 4. Tune installation budget profiles against Christopher's real largest dictionaries/models/comics. Larger opt-in defaults are finite allowances, not proof that every real collection fits.
 5. Consider decoder/compressor reuse or more concurrency only if real workload profiles show a benefit. Bounded libdeflate remains opt-in.
-6. Replace `Vendor/ZIPFoundation` with zero-dependency native Apple `Compression` / Darwin `libz` binary codec. See complete file-by-file roadmap in [ZERO-VENDOR-PLAN.md](ZERO-VENDOR-PLAN.md).
+6. [COMPLETED] Replace `Vendor/ZIPFoundation` with zero-dependency native Apple `Compression` / Darwin `libz` binary codec. See complete file-by-file roadmap in [ZERO-VENDOR-PLAN.md](ZERO-VENDOR-PLAN.md).
 
