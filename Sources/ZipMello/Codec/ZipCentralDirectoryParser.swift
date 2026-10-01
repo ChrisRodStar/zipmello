@@ -21,8 +21,22 @@ struct ZipCentralDirectoryParser: Sendable {
         tailData.withUnsafeBytes { buffer in
             for i in stride(from: buffer.count - 22, through: 0, by: -1) {
                 if ZipBinaryBuffer.readUInt32(from: buffer, offset: i) == ZipMagic.endOfCentralDirectory {
-                    eocdOffsetInTail = i
-                    break
+                    let commentLen = Int(ZipBinaryBuffer.readUInt16(from: buffer, offset: i + 20))
+                    if i + 22 + commentLen == buffer.count {
+                        eocdOffsetInTail = i
+                        break
+                    }
+                }
+            }
+            if eocdOffsetInTail < 0 {
+                for i in stride(from: buffer.count - 22, through: 0, by: -1) {
+                    if ZipBinaryBuffer.readUInt32(from: buffer, offset: i) == ZipMagic.endOfCentralDirectory {
+                        let commentLen = Int(ZipBinaryBuffer.readUInt16(from: buffer, offset: i + 20))
+                        if i + 22 + commentLen <= buffer.count {
+                            eocdOffsetInTail = i
+                            break
+                        }
+                    }
                 }
             }
         }

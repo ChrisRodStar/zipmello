@@ -351,21 +351,23 @@ public actor ArchiveReader {
         var completed: UInt64 = 0
         progress?(.init(completedBytes: 0, totalBytes: total, completedEntries: 0, totalEntries: plan.files.count))
         for (number, item) in plan.files.enumerated() {
-            try Task.checkCancellation()
-            guard let entry = index[item.member.path] else { throw ArchiveFailure.missingEntry(item.member.path) }
-            let url = staging.appendingPathComponent(item.path)
-            let descriptor = try FileDescriptor.open(url.path, .writeOnly, options: [.create, .exclusiveCreate, .noFollow], permissions: .ownerReadWrite)
-            do {
-                var emitted: UInt64 = 0
-                try worker.consume(entry, path: item.member.path) { chunk in
-                    try descriptor.writeAll(chunk)
-                    emitted += UInt64(chunk.count)
-                    progress?(.init(completedBytes: completed + emitted, totalBytes: total, completedEntries: number, totalEntries: plan.files.count))
-                }
-                try descriptor.close()
-            } catch { try? descriptor.close(); throw error }
-            completed += item.member.uncompressedBytes
-            progress?(.init(completedBytes: completed, totalBytes: total, completedEntries: number + 1, totalEntries: plan.files.count))
+            try autoreleasepool {
+                try Task.checkCancellation()
+                guard let entry = index[item.member.path] else { throw ArchiveFailure.missingEntry(item.member.path) }
+                let url = staging.appendingPathComponent(item.path)
+                let descriptor = try FileDescriptor.open(url.path, .writeOnly, options: [.create, .exclusiveCreate, .noFollow], permissions: .ownerReadWrite)
+                do {
+                    var emitted: UInt64 = 0
+                    try worker.consume(entry, path: item.member.path) { chunk in
+                        try descriptor.writeAll(chunk)
+                        emitted += UInt64(chunk.count)
+                        progress?(.init(completedBytes: completed + emitted, totalBytes: total, completedEntries: number, totalEntries: plan.files.count))
+                    }
+                    try descriptor.close()
+                } catch { try? descriptor.close(); throw error }
+                completed += item.member.uncompressedBytes
+                progress?(.init(completedBytes: completed, totalBytes: total, completedEntries: number + 1, totalEntries: plan.files.count))
+            }
         }
         try Task.checkCancellation()
         try worker.validateIdentity()
