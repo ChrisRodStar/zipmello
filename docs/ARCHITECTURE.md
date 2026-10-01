@@ -1,37 +1,66 @@
-# Architecture & Subsystem Design
+# Architecture & Engine Design
 
-ZipMello is designed for thread safety, low memory overhead, and high performance on Apple platforms (iOS 27 / macOS 27). It relies on zero third-party dependencies.
-
----
-
-## Codec Subsystem (`Sources/ZipMello/Codec/`)
-
-The core binary parsing and streaming engines are contained in `Sources/ZipMello/Codec/`:
-
-1. **`ZipBinaryStructures`**: High-performance little-endian binary buffer reader and writer. Defines ZIP and ZIP64 magic signatures (`0x04034b50`, `0x02014b50`, `0x06054b50`, `0x06064b50`, `0x07064b50`).
-2. **`ZipChecksum`**: Hardware-accelerated 32-bit CRC checksum calculation leveraging Darwin `libz` (`crc32`).
-3. **`ZipDeflateEngine`**: Streaming raw RFC 1951 DEFLATE compressor and decompressor built directly on system `zlib` (`inflateInit2_` & `deflateInit2_` with `windowBits = -15`).
-4. **`ZipCentralDirectoryParser`**: Tail-scanning ZIP/ZIP64 EOCD and central directory parser. Decodes UTF-8 (`0x0800` bit 11) and legacy CP437 filenames.
-5. **`ZipBinaryWriter`**: Streaming binary creator writing local headers, Stored/DEFLATE payloads, central directory records, and automatic ZIP64 footers.
+ZipMello is engineered for high performance, memory efficiency, and thread safety on Apple platforms. It requires zero third-party dependencies.
 
 ---
 
-## Concurrency & Actor Model
+## Subsystem Overview
 
-- **Actor Isolation**: High-level types (`ArchiveReader`, `ArchiveWriter`, `ArchiveMemoryService`) are Swift actors that run on dedicated `DispatchSerialQueue` executors (`UnownedSerialExecutor`).
-- **Positional File Reads**: Positional file reads use Swift System `FileDescriptor.read(fromAbsoluteOffset:into:)` (`pread`). Multiple reader lanes perform concurrent reads from a single shared file descriptor without seek cursor contention or global locks.
-- **Atomic Staging**: Extraction and archive creation write to temporary staging files (`.extract-...` or `.archive-...`) and atomically rename them to the destination path only after CRC and budget validation succeed.
+```
++------------------------------------------------------------------+
+|                          Public APIs                             |
+|  ArchiveReader  |  ArchiveWriter  |  ArchivePageStore  |  CLI   |
++------------------------------------------------------------------+
+                                  |
+                                  v
++------------------------------------------------------------------+
+|                    Native Codec Subsystem                        |
+|                                                                  |
+|  +------------------------+      +----------------------------+  |
+|  | ZipCentralDirectory    |      | ZipDeflateEngine           |  |
+|  | Parser (Tail Scanner)  |      | (Streaming zlib)           |  |
+|  +------------------------+      +----------------------------+  |
+|  | ZipChecksum            |      | ZipBinaryWriter            |  |
+|  | (Darwin libz CRC32)    |      | (ZIP & ZIP64 Binary)       |  |
+|  +------------------------+      +----------------------------+  |
++------------------------------------------------------------------+
+                                  |
+                                  v
++------------------------------------------------------------------+
+|                    System Infrastructure                         |
+|  Swift System FileDescriptor  |  Darwin libz  |  Dispatch Queues |
++------------------------------------------------------------------+
+```
 
 ---
 
-## Resource & Security Limits
+## Component Architecture
 
-`ArchiveLimits` enforces memory and security bounds across all operations:
+1. **`ZipCentralDirectoryParser`**
+   - Scans the End of Central Directory (EOCD) from the tail of the file (up to 66 KiB from EOF).
+   - Parses ZIP64 EOCD Record (`0x06064b50`) and Locator (`0x07064b50`) when entry counts $\ge 65,535$ or offsets $\ge 4\text{GB}$.
+   - Decodes UTF-8 (`0x0800` bit 11) and CP437 legacy filename encodings.
 
-- **Zip Slip Prevention**: Rejects relative path traversal components (`..`, `.`, leading `/`, `\`, `:`) in `ArchivePath.validate`.
-- **Symlink Protection**: Rejects symlink entry extraction (`POSIX` mode `0xA000`) to prevent filesystem symlink exploits.
-- **Budget Enforcements**:
-  - Maximum archive byte size (default: 512 MB)
-  - Maximum single entry size (default: 250 MB)
-  - Maximum expanded archive size (default: 2 GB)
-  - Maximum entries per directory (default: 20,000)
+2. **`ZipDeflateEngine`**
+   - High-throughput streaming raw DEFLATE (RFC 1951) compressor and decompressor using system `zlib` (`inflateInit2_` & `deflateInit2_` with `windowBits = -15`).
+   - Uses zero-copy reusable scratch buffers (`UnsafeMutableRawBufferPointer`) to eliminate Swift `Data` reallocations per chunk.
+
+3. **`ZipChecksum`**
+   - Hardware-accelerated 32-bit CRC checksum engine calling Darwin `libz` (`crc32`).
+   - Validates payload integrity during streaming decompression and extraction.
+
+4. **`ZipBinaryWriter`**
+   - Streaming binary encoder writing Local Headers (`0x04034b50`), Stored/DEFLATE entry payloads, Central Directory records (`0x02014b50`), EOCD footers, and ZIP64 structures.
+
+---
+
+## Concurrency & Memory Safety
+
+- **Swift Concurrency Actors**: High-level types (`ArchiveReader`, `ArchiveWriter`, `ArchiveMemoryService`) are actors backed by dedicated `DispatchSerialQueue` executors (`UnownedSerialExecutor`).
+- **Positional `pread` I/O**: Multi-lane reader instances perform non-blocking positional reads (`FileDescriptor.read(fromAbsoluteOffset:into:)`) from a single shared file descriptor without seek cursor locks.
+- **Atomic Staging**: Extraction and creation operations write payload chunks to isolated hidden staging files (`.extract-...` or `.archive-...`) and atomically replace the destination path only after CRC and size validation succeed.
+- **Resource Limits (`ArchiveLimits`)**:
+  - Maximum Archive Size (default: 512 MB)
+  - Maximum Entry Size (default: 250 MB)
+  - Maximum Expanded Size (default: 2 GB)
+  - Maximum Entry Count (default: 20,000)
