@@ -1,12 +1,24 @@
 import Foundation
 import zlib
 
-/// Native streaming raw DEFLATE compression and decompression engine using zlib (-15 windowBits).
+/// Native streaming raw DEFLATE compression and decompression engine.
+///
+/// Implements RFC 1951 raw DEFLATE framing using system `libz` with `windowBits = -15`.
+/// The negative windowBits parameter directs zlib to omit RFC 1950 headers/trailers and
+/// RFC 1952 gzip wrappers, as required by PKWARE APPNOTE.TXT Section 4.4.5 (Compression Method 8).
 enum ZipDeflateEngine {
     typealias Consumer = (_ chunk: Data) throws -> Void
     typealias Provider = (_ offset: UInt64, _ maxCount: Int) throws -> Data
 
-    /// Decompresses a raw DEFLATE stream (windowBits = -15) using zlib.
+    /// Decompresses a raw DEFLATE payload stream using sliding buffer windows.
+    ///
+    /// - Parameters:
+    ///   - compressedBytes: Total count of compressed input bytes to read from `provider`.
+    ///   - bufferBytes: Size in bytes of each streaming chunk buffer.
+    ///   - skipCRC: If `true`, avoids computing the uncompressed CRC-32 checksum during decompression.
+    ///   - provider: Async/throwing callback fetching input slices on demand.
+    ///   - consumer: Throwing callback receiving decoded uncompressed chunks as they are emitted.
+    /// - Returns: Computed 32-bit CRC checksum of all uncompressed output bytes.
     static func decompress(
         compressedBytes: UInt64,
         bufferBytes: Int = 65536,
@@ -20,18 +32,22 @@ enum ZipDeflateEngine {
         strm.zfree = nil
         strm.opaque = nil
 
+        // Negative windowBits (-15) selects raw DEFLATE without zlib wrapper headers.
         let initResult = inflateInit2_(&strm, -15, ZLIB_VERSION, Int32(MemoryLayout<z_stream>.size))
         guard initResult == Z_OK else {
             throw ArchiveFailure.invalidSource("inflateInit2 failed with status \(initResult)")
         }
-        defer { inflateEnd(&strm) }
+        defer {
+            inflateEnd(&strm)
+        }
 
         let outBuffer = UnsafeMutablePointer<Bytef>.allocate(capacity: bufferBytes)
-        defer { outBuffer.deallocate() }
+        defer {
+            outBuffer.deallocate()
+        }
 
         var readPosition: UInt64 = 0
         var currentInputChunk: Data?
-
         var streamFinished = false
 
         while !streamFinished {
@@ -44,7 +60,9 @@ enum ZipDeflateEngine {
                 currentInputChunk = chunk
             }
 
-            guard let inputChunk = currentInputChunk, !inputChunk.isEmpty else { break }
+            guard let inputChunk = currentInputChunk, !inputChunk.isEmpty else {
+                break
+            }
 
             var flush = Z_NO_FLUSH
             if readPosition >= compressedBytes {
@@ -55,6 +73,7 @@ enum ZipDeflateEngine {
                 guard let baseAddr = rawBuf.baseAddress else { return }
                 let bytePtr = baseAddr.assumingMemoryBound(to: Bytef.self)
                 let offset = inputChunk.count - Int(strm.avail_in)
+
                 if strm.avail_in == 0 {
                     strm.next_in = UnsafeMutablePointer(mutating: bytePtr)
                     strm.avail_in = uInt(inputChunk.count)
@@ -95,7 +114,14 @@ enum ZipDeflateEngine {
         return crc
     }
 
-    /// Compresses uncompressed data into a raw DEFLATE stream (windowBits = -15) using zlib.
+    /// Compresses uncompressed data into a raw DEFLATE stream using sliding buffer windows.
+    ///
+    /// - Parameters:
+    ///   - uncompressedBytes: Total count of uncompressed bytes to consume.
+    ///   - bufferBytes: Size in bytes of each streaming chunk buffer.
+    ///   - provider: Throwing callback providing uncompressed data chunks.
+    ///   - consumer: Throwing callback receiving compressed DEFLATE bytes.
+    /// - Returns: Computed 32-bit CRC checksum of all uncompressed input bytes.
     static func compress(
         uncompressedBytes: UInt64,
         bufferBytes: Int = 65536,
@@ -108,14 +134,27 @@ enum ZipDeflateEngine {
         strm.zfree = nil
         strm.opaque = nil
 
-        let initResult = deflateInit2_(&strm, Z_DEFAULT_COMPRESSION, Z_DEFLATED, -15, 8, Z_DEFAULT_STRATEGY, ZLIB_VERSION, Int32(MemoryLayout<z_stream>.size))
+        let initResult = deflateInit2_(
+            &strm,
+            Z_DEFAULT_COMPRESSION,
+            Z_DEFLATED,
+            -15,
+            8,
+            Z_DEFAULT_STRATEGY,
+            ZLIB_VERSION,
+            Int32(MemoryLayout<z_stream>.size)
+        )
         guard initResult == Z_OK else {
             throw ArchiveFailure.invalidSource("deflateInit2 failed with status \(initResult)")
         }
-        defer { deflateEnd(&strm) }
+        defer {
+            deflateEnd(&strm)
+        }
 
         let outBuffer = UnsafeMutablePointer<Bytef>.allocate(capacity: bufferBytes)
-        defer { outBuffer.deallocate() }
+        defer {
+            outBuffer.deallocate()
+        }
 
         var readPosition: UInt64 = 0
         var currentInputChunk: Data?

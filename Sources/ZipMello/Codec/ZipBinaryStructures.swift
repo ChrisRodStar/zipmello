@@ -50,54 +50,36 @@ enum ZipBinaryBuffer {
     @inline(__always)
     static func readUInt16(from buffer: UnsafeRawBufferPointer, offset: Int) -> UInt16 {
         guard offset + 2 <= buffer.count else { return 0 }
-        var value: UInt16 = 0
-        withUnsafeMutableBytes(of: &value) { valPtr in
-            valPtr.copyMemory(from: UnsafeRawBufferPointer(rebasing: buffer[offset..<(offset + 2)]))
-        }
-        return UInt16(littleEndian: value)
+        return UInt16(littleEndian: buffer.loadUnaligned(fromByteOffset: offset, as: UInt16.self))
     }
 
     @inline(__always)
     static func readUInt32(from buffer: UnsafeRawBufferPointer, offset: Int) -> UInt32 {
         guard offset + 4 <= buffer.count else { return 0 }
-        var value: UInt32 = 0
-        withUnsafeMutableBytes(of: &value) { valPtr in
-            valPtr.copyMemory(from: UnsafeRawBufferPointer(rebasing: buffer[offset..<(offset + 4)]))
-        }
-        return UInt32(littleEndian: value)
+        return UInt32(littleEndian: buffer.loadUnaligned(fromByteOffset: offset, as: UInt32.self))
     }
 
     @inline(__always)
     static func readUInt64(from buffer: UnsafeRawBufferPointer, offset: Int) -> UInt64 {
         guard offset + 8 <= buffer.count else { return 0 }
-        var value: UInt64 = 0
-        withUnsafeMutableBytes(of: &value) { valPtr in
-            valPtr.copyMemory(from: UnsafeRawBufferPointer(rebasing: buffer[offset..<(offset + 8)]))
-        }
-        return UInt64(littleEndian: value)
+        return UInt64(littleEndian: buffer.loadUnaligned(fromByteOffset: offset, as: UInt64.self))
     }
 
     @inline(__always)
     static func writeUInt16(_ value: UInt16, into buffer: UnsafeMutableRawBufferPointer, offset: Int) {
-        var little = value.littleEndian
-        withUnsafeBytes(of: &little) { valPtr in
-            buffer.baseAddress?.advanced(by: offset).copyMemory(from: valPtr.baseAddress!, byteCount: 2)
-        }
+        guard offset + 2 <= buffer.count else { return }
+        buffer.storeBytes(of: value.littleEndian, toByteOffset: offset, as: UInt16.self)
     }
 
     @inline(__always)
     static func writeUInt32(_ value: UInt32, into buffer: UnsafeMutableRawBufferPointer, offset: Int) {
-        var little = value.littleEndian
-        withUnsafeBytes(of: &little) { valPtr in
-            buffer.baseAddress?.advanced(by: offset).copyMemory(from: valPtr.baseAddress!, byteCount: 4)
-        }
+        guard offset + 4 <= buffer.count else { return }
+        buffer.storeBytes(of: value.littleEndian, toByteOffset: offset, as: UInt32.self)
     }
 
     @inline(__always)
     static func writeUInt64(_ value: UInt64, into buffer: UnsafeMutableRawBufferPointer, offset: Int) {
-        var little = value.littleEndian
-        withUnsafeBytes(of: &little) { valPtr in
-            buffer.baseAddress?.advanced(by: offset).copyMemory(from: valPtr.baseAddress!, byteCount: 8)
-        }
+        guard offset + 8 <= buffer.count else { return }
+        buffer.storeBytes(of: value.littleEndian, toByteOffset: offset, as: UInt64.self)
     }
 }
