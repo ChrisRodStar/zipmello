@@ -1,0 +1,58 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+permissions:
+  contents: write
+
+jobs:
+  build-release:
+    name: Build & Publish Release
+    runs-on: macos-15
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Select Xcode
+        run: |
+          if [ -d "/Applications/Xcode_16.2.app" ]; then
+            sudo xcode-select -s /Applications/Xcode_16.2.app
+          elif [ -d "/Applications/Xcode_16.1.app" ]; then
+            sudo xcode-select -s /Applications/Xcode_16.1.app
+          elif [ -d "/Applications/Xcode_16.0.app" ]; then
+            sudo xcode-select -s /Applications/Xcode_16.0.app
+          fi
+          xcodebuild -version
+          swift --version
+
+      - name: Run Test Suite
+        run: swift test --parallel
+
+      - name: Build Universal CLI Executable
+        run: |
+          swift build -c release --arch arm64 --build-path .build/arm64
+          swift build -c release --arch x86_64 --build-path .build/x86_64
+          mkdir -p dist
+          lipo -create -output dist/zipmello .build/arm64/release/zipmello .build/x86_64/release/zipmello
+          chmod +x dist/zipmello
+          lipo -info dist/zipmello
+          cd dist && zip -r ../zipmello-macos-universal.zip zipmello && cd ..
+
+      - name: Generate SHA-256 Checksum
+        run: |
+          shasum -a 256 zipmello-macos-universal.zip > zipmello-macos-universal.zip.sha256
+          cat zipmello-macos-universal.zip.sha256
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            zipmello-macos-universal.zip
+            zipmello-macos-universal.zip.sha256
+          generate_release_notes: true

@@ -10,8 +10,12 @@ private final class ConsumerWorkspace: Sendable {
         root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
     }
-    deinit { try? FileManager.default.removeItem(at: root) }
-    func file(_ path: String) -> URL { root.appendingPathComponent(path) }
+    deinit {
+        try? FileManager.default.removeItem(at: root)
+    }
+    func file(_ path: String) -> URL {
+        root.appendingPathComponent(path)
+    }
     func upstream(_ paths: [String], bytes: Data = Data("payload".utf8)) async throws -> URL {
         let url = file(UUID().uuidString + ".zip")
         let assets = paths.map { path -> ArchiveAsset in
@@ -26,14 +30,25 @@ private final class ConsumerWorkspace: Sendable {
         }
         let total = sizes.reduce(0, +)
         FileManager.default.createFile(atPath: url.path, contents: nil)
-        try ZipBinaryWriter.writeArchive(to: url, assets: assets, sizes: sizes, limits: .init(), tuning: .init(), progress: nil, totalBytes: total)
+        try ZipBinaryWriter.writeArchive(
+            to: url,
+            assets: assets,
+            sizes: sizes,
+            limits: .init(),
+            tuning: .init(),
+            progress: nil,
+            totalBytes: total
+        )
         return url
     }
 }
 
 @Suite struct ConsumerTests {
-    @Test(arguments: ["descriptor32", "descriptor64", "descriptor-unsigned", "zip64-zero", "cp437"])
-    func `External data descriptors ZIP64 local headers and CP437 names interoperate`(fixture: String) async throws {
+    @Test(
+        "External data descriptors ZIP64 local headers and CP437 names interoperate",
+        arguments: ["descriptor32", "descriptor64", "descriptor-unsigned", "zip64-zero", "cp437"]
+    )
+    func externalDataDescriptorsAndCP437(fixture: String) async throws {
         let url = try #require(Bundle.module.url(forResource: fixture, withExtension: "zip", subdirectory: "Fixtures"))
         let reader = try await ArchiveReader.open(url)
         let path = fixture == "cp437" ? "café.txt" : fixture == "zip64-zero" ? "zero.txt" : "日本語/page.txt"
@@ -43,13 +58,17 @@ private final class ConsumerWorkspace: Sendable {
         #expect(try await memory.read(path) == expected)
     }
 
-    @Test(arguments: [ArchiveCompression.stored, .deflate])
-    func `Downloaded bytes and sliced Data read without a spool`(compression: ArchiveCompression) async throws {
+    @Test(
+        "Downloaded bytes and sliced Data read without a spool",
+        arguments: [ArchiveCompression.stored, .deflate]
+    )
+    func downloadedBytesAndSlicedData(compression: ArchiveCompression) async throws {
         let work = try ConsumerWorkspace(), bytes = Data(repeating: 42, count: 300_000)
         let url = work.file("remote.zip")
         try await ArchiveWriter().create(at: url, assets: [.init(path: "日本語/chapter.md", content: .bytes(bytes), compression: compression)])
         let data = try Data(contentsOf: url)
-        var envelope = Data([1, 2, 3]); envelope.append(data)
+        var envelope = Data([1, 2, 3])
+        envelope.append(data)
         let reader = try await ArchiveReader.open(data: envelope.dropFirst(3), limits: .sourcePages, tuning: .pagePrefetch)
         #expect(try await reader.read("日本語/chapter.md") == bytes)
         #expect(try ArchiveMemoryReader(data: envelope.dropFirst(3), limits: .sourcePages).read("日本語/chapter.md") == bytes)
@@ -64,7 +83,8 @@ private final class ConsumerWorkspace: Sendable {
         #expect(try FileManager.default.contentsOfDirectory(atPath: work.root.path) == ["remote.zip"])
     }
 
-    @Test func `Compatible lookup resolves aliases and prefers exact paths`() async throws {
+    @Test("Compatible lookup resolves aliases and prefers exact paths")
+    func compatibleLookupResolvesAliases() async throws {
         let work = try ConsumerWorkspace()
         let url = try await work.upstream(["./OEBPS/images/plate%20one.png", "OEBPS/Cover.PNG"])
         let reader = try await ArchiveReader.open(url)
@@ -75,7 +95,8 @@ private final class ConsumerWorkspace: Sendable {
         #expect(try await reader.member("OEBPS/Cover.PNG", lookup: .compatible).path == "OEBPS/Cover.PNG")
     }
 
-    @Test func `Ambiguous aliases fail while exact names remain readable`() async throws {
+    @Test("Ambiguous aliases fail while exact names remain readable")
+    func ambiguousAliasesFail() async throws {
         let work = try ConsumerWorkspace()
         let url = try await work.upstream(["Cover.PNG", "cover.png", "safe%2F..%2Fescape"])
         let reader = try await ArchiveReader.open(url)
@@ -85,7 +106,8 @@ private final class ConsumerWorkspace: Sendable {
         #expect(try await reader.read("safe%2F..%2Fescape", lookup: .compatible) == Data("payload".utf8))
     }
 
-    @Test func `Tree extraction handles Payload and empty directories`() async throws {
+    @Test("Tree extraction handles Payload and empty directories")
+    func treeExtractionHandlesPayload() async throws {
         let work = try ConsumerWorkspace()
         let url = try await work.upstream(["./", "./Payload/source.json", "Payload/nested/main.wasm", "empty/"])
         let reader = try await ArchiveReader.open(url)
@@ -97,8 +119,11 @@ private final class ConsumerWorkspace: Sendable {
         await #expect(throws: ArchiveFailure.destinationExists) { try await reader.extractAll(to: work.file("installed")) }
     }
 
-    @Test(arguments: [["A/page", "a/page"], ["file", "file/page"], ["./page", "page"], ["é/page", "e\u{301}/page"]])
-    func `Tree collisions never publish`(paths: [String]) async throws {
+    @Test(
+        "Tree collisions never publish",
+        arguments: [["A/page", "a/page"], ["file", "file/page"], ["./page", "page"], ["é/page", "e\u{301}/page"]]
+    )
+    func treeCollisionsNeverPublish(paths: [String]) async throws {
         let work = try ConsumerWorkspace()
         let url = try await work.upstream(paths)
         await #expect(throws: (any Error).self) {
@@ -109,7 +134,8 @@ private final class ConsumerWorkspace: Sendable {
         #expect(try FileManager.default.contentsOfDirectory(atPath: work.root.path).allSatisfy { !$0.hasPrefix(".tree-") })
     }
 
-    @Test func `CRC preflight and tree extraction reject corrupted payloads`() async throws {
+    @Test("CRC preflight and tree extraction reject corrupted payloads")
+    func crcPreflightRejectsCorrupted() async throws {
         let work = try ConsumerWorkspace(), bytes = Data("unique-crc-payload".utf8)
         let url = try await work.upstream(["nested/page"], bytes: bytes)
         var zip = try Data(contentsOf: url)
@@ -120,7 +146,8 @@ private final class ConsumerWorkspace: Sendable {
         #expect(try FileManager.default.contentsOfDirectory(atPath: work.root.path).count == 1)
     }
 
-    @Test func `Cancellation during tree progress removes partial files`() async throws {
+    @Test("Cancellation during tree progress removes partial files")
+    func cancellationRemovesPartialFiles() async throws {
         let work = try ConsumerWorkspace()
         let reader = try await ArchiveReader.open(await work.upstream(["one", "two"]))
         let task = Task {
@@ -133,7 +160,8 @@ private final class ConsumerWorkspace: Sendable {
         #expect(try FileManager.default.contentsOfDirectory(atPath: work.root.path).allSatisfy { !$0.hasPrefix(".tree-") })
     }
 
-    @Test func `Recursive export preserves sidecars metadata and empty folders`() async throws {
+    @Test("Recursive export preserves sidecars metadata and empty folders")
+    func recursiveExportPreservesMetadata() async throws {
         let work = try ConsumerWorkspace(), source = work.file("source")
         try FileManager.default.createDirectory(at: source.appendingPathComponent("nested/empty"), withIntermediateDirectories: true)
         for path in ["1.png", "10.png", "2.png", "2.desc.txt", ".metadata.json", "ComicInfo.xml", "nested/page.md"] {
@@ -155,7 +183,8 @@ private final class ConsumerWorkspace: Sendable {
         #expect(zip(values, values.dropFirst()).allSatisfy { $0.completedBytes <= $1.completedBytes })
     }
 
-    @Test func `Recursive export rejects links and leaves no archive`() async throws {
+    @Test("Recursive export rejects links and leaves no archive")
+    func recursiveExportRejectsLinks() async throws {
         let work = try ConsumerWorkspace()
         try FileManager.default.createDirectory(at: work.file("source"), withIntermediateDirectories: true)
         try FileManager.default.createSymbolicLink(at: work.file("source/link"), withDestinationURL: work.file("outside"))
@@ -165,7 +194,8 @@ private final class ConsumerWorkspace: Sendable {
         #expect(!FileManager.default.fileExists(atPath: work.file("bad.zip").path))
     }
 
-    @Test func `Concurrent page requests share one extracted file and retain active leases`() async throws {
+    @Test("Concurrent page requests share one extracted file and retain active leases")
+    func concurrentPageRequestsShareFile() async throws {
         let work = try ConsumerWorkspace(), url = work.file("pages.cbz")
         try await ArchiveWriter().create(at: url, assets: [.init(path: "page.png", content: .bytes(Data(repeating: 7, count: 200_000)))])
         let store = try ArchivePageStore(directory: work.root)
@@ -185,7 +215,8 @@ private final class ConsumerWorkspace: Sendable {
         #expect(await store.statistics().activeLeases == 0)
     }
 
-    @Test func `Page budgets preserve leased pages and invalidate replaced archives`() async throws {
+    @Test("Page budgets preserve leased pages and invalidate replaced archives")
+    func pageBudgetsPreserveLeasedPages() async throws {
         let work = try ConsumerWorkspace(), url = work.file("pages.cbz")
         let writer = ArchiveWriter()
         try await writer.create(at: url, assets: [.init(path: "one", content: .bytes(Data(repeating: 1, count: 10))), .init(path: "two", content: .bytes(Data(repeating: 2, count: 10)))])
@@ -202,10 +233,12 @@ private final class ConsumerWorkspace: Sendable {
         try await writer.create(at: url, assets: [.init(path: "two", content: .bytes(Data(repeating: 3, count: 10)))])
         let replaced = try await store.lease("two", from: url)
         #expect(try Data(contentsOf: replaced.url) == Data(repeating: 3, count: 10))
-        await replaced.release(); await store.removeAll()
+        await replaced.release()
+        await store.removeAll()
     }
 
-    @Test func `Local comics naturally order text and images and lazily load metadata`() async throws {
+    @Test("Local comics naturally order text and images and lazily load metadata")
+    func localComicsNaturallyOrder() async throws {
         let work = try ConsumerWorkspace()
         let metadata = ComicInfo(fields: ["Title": "A & B <日本語>", "Number": "1.5", "Notes": "!AIDOKUDATA:{\"id\":\"123\"}", "Manga": "YesAndRightToLeft"], pages: [["Image": "0", "Type": "FrontCover"]])
         let url = work.file("chapter.zip")
@@ -224,8 +257,11 @@ private final class ConsumerWorkspace: Sendable {
         await comic.close()
     }
 
-    @Test(arguments: [String.Encoding.utf8, .utf16])
-    func `ComicInfo rejects external entities and preserves escaped values`(encoding: String.Encoding) throws {
+    @Test(
+        "ComicInfo rejects external entities and preserves escaped values",
+        arguments: [String.Encoding.utf8, .utf16]
+    )
+    func comicInfoRejectsExternalEntities(encoding: String.Encoding) throws {
         let metadata = ComicInfo(fields: ["Summary": "& < > \" '\n日本語"], pages: [["Image": "0"]])
         #expect(try ComicInfoCodec.decode(ComicInfoCodec.encode(metadata)) == metadata)
         let encoded = try #require("<ComicInfo><Title>日本語</Title></ComicInfo>".data(using: encoding))
@@ -234,7 +270,8 @@ private final class ConsumerWorkspace: Sendable {
         #expect(throws: ComicInfoError.invalidName("Title><bad")) { try ComicInfoCodec.encode(ComicInfo(fields: ["Title><bad": "x"])) }
     }
 
-    @Test func `Streaming consumption validates every byte without retaining member output`() async throws {
+    @Test("Streaming consumption validates every byte without retaining member output")
+    func streamingConsumptionValidatesEveryByte() async throws {
         let work = try ConsumerWorkspace(), bytes = Data(repeating: 9, count: 200_000)
         let url = work.file("stream.zip")
         try await ArchiveWriter().create(at: url, assets: [.init(path: "member", content: .bytes(bytes), compression: .deflate)])
@@ -247,7 +284,8 @@ private final class ConsumerWorkspace: Sendable {
         #expect(count.withLock { $0 } == bytes.count)
     }
 
-    @Test func `Cancellation during export progress removes staging`() async throws {
+    @Test("Cancellation during export progress removes staging")
+    func cancellationDuringExportRemovesStaging() async throws {
         let work = try ConsumerWorkspace()
         let task = Task {
             try await ArchiveWriter().create(at: work.file("cancelled.zip"), assets: [
@@ -261,7 +299,8 @@ private final class ConsumerWorkspace: Sendable {
         #expect(try FileManager.default.contentsOfDirectory(atPath: work.root.path).isEmpty)
     }
 
-    @Test func `Dictionary preflight verifies metadata and rejects escaping native titles`() async throws {
+    @Test("Dictionary preflight verifies metadata and rejects escaping native titles")
+    func dictionaryPreflightVerifiesMetadata() async throws {
         let work = try ConsumerWorkspace()
         let writer = ArchiveWriter(), url = work.file("dictionary.zip")
         try await writer.create(at: url, assets: [.init(path: "index.json", content: .bytes(Data("{\"title\":\"Dictionary\"}".utf8)), compression: .deflate), .init(path: "term_bank_1.json", content: .bytes(Data("[]".utf8)), compression: .deflate)])
