@@ -1,10 +1,114 @@
-# ZipMello
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/banner-dark.svg">
+    <source media="(prefers-color-scheme: light)" srcset="assets/banner-light.svg">
+    <img alt="ZipMello Banner" src="assets/banner-dark.svg" width="100%">
+  </picture>
+</p>
 
-Fast, native ZIP & CBZ codec for Swift 6 on iOS 18+ and macOS 15+ (also supporting tvOS 18+, watchOS 11+, and visionOS 2+).
-
-ZipMello is a Swift framework for archive operations. Built on Darwin `zlib` and Swift Concurrency, it provides hardware-accelerated CRC32 checksums, streaming DEFLATE compression, lock-free parallel reads, and ZIP64 format support.
+<p align="center">
+  <a href="https://github.com/ChrisRodStar/zipmello/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/ChrisRodStar/zipmello/ci.yml?branch=main&label=CI&style=flat-square&color=22c55e" alt="CI Status"></a>
+  <a href="https://github.com/ChrisRodStar/zipmello/releases/tag/v1.0.0"><img src="https://img.shields.io/github/v/release/ChrisRodStar/zipmello?style=flat-square&label=Release&color=F5C77E" alt="Release v1.0.0"></a>
+  <img src="https://img.shields.io/badge/Swift-6.0%20Strict-F05138?style=flat-square&logo=swift&logoColor=white" alt="Swift 6.0 Strict">
+  <img src="https://img.shields.io/badge/Platforms-macOS%20%7C%20iOS%20%7C%20tvOS%20%7C%20watchOS%20%7C%20visionOS-1C1B1A?style=flat-square" alt="Platforms">
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-blue.svg?style=flat-square" alt="MIT License"></a>
+</p>
 
 ---
+
+**ZipMello** is a Swift 6 ZIP/CBZ engine built around the access patterns of comic and manga readers. It uses positional archive reads for concurrent page access, natural page ordering, bounded page leasing for scroll views, and direct in-memory archive processing.
+
+## Reader Benchmarks
+
+Measured head-to-head on Apple Silicon comparing ZipMello 1.0.0 against [ZIPFoundation 0.9.20](https://github.com/weichsel/ZIPFoundation):
+
+| Benchmark | ZIPFoundation 0.9.20 | ZipMello 1.0.0 | Speedup |
+| :--- | ---: | ---: | ---: |
+| **Random-Access Page Reads**<br><sub>80 pages directly from .cbz</sub> | 17.0 ms | **3.2 ms** | **5.31×** |
+| **Concurrent Prefetching**<br><sub>32 concurrent page reads</sub> | 7.1 ms | **1.4 ms** | **4.93×** |
+| **In-Memory Volume Extraction**<br><sub>50 entries, zero disk I/O</sub> | 6.3 ms | **2.0 ms** | **3.15×** |
+| **Directory Extraction**<br><sub>500 files, 50 MB to disk</sub> | 83.2 ms | **40.0 ms** | **2.08×** |
+| **Central Directory Inspection**<br><sub>5,000 entries</sub> | 14.2 ms | **8.0 ms** | **1.78×** |
+
+## Key Features
+
+- **Lock-Free Positional Reads**: Independent `pread` calls allow background tasks to prefetch future pages without locking the file handle or stalling the main thread.
+- **Natural Page Sorting**: Pages sort via `localizedStandardCompare` so `page2.jpg` precedes `page10.jpg`, automatically filtering out `__MACOSX`, dot-underscore files, and `.DS_Store`.
+- **Bounded Page Leasing (`ArchivePageStore`)**: Reference-counted page leasing with bounded disk usage and LRU eviction, keeping files on disk while visible in scroll views.
+- **Zero-Disk Streaming**: Parse and decompress downloaded `.cbz` payloads directly from `Data` buffers without writing temporary files to flash storage.
+- **Hardened `ComicInfo.xml`**: Parses and serializes ComicRack metadata with built-in XXE and expansion bomb protection.
+
+## Quickstart
+
+### Open Archive & Read Pages
+
+`LocalComicArchive` loads pages in natural reading order and strips OS artifacts:
+
+```swift
+import ZipMelloConsumers
+
+let comic = try await LocalComicArchive.open(archiveURL)
+
+// Cover image:
+if let coverData = try await comic.coverBytes() {
+    // UIImage(data: coverData)
+}
+
+// Read any page by index:
+let pageData = try await comic.bytes(at: 0)
+
+// Optional ComicInfo.xml metadata:
+if let info = try await comic.comicInfo() {
+    print("\(info["Series"] ?? "") #\(info["Number"] ?? "")")
+}
+
+await comic.close()
+```
+
+### Bounded Page Caching for Scroll Views
+
+Lease pages for visible cells; `ArchivePageStore` handles eviction when the lease releases:
+
+```swift
+import ZipMello
+
+let store = try ArchivePageStore(
+    directory: cacheURL,
+    maximumBytes: 100 * 1024 * 1024, // 100 MB disk budget
+    maximumFiles: 50
+)
+
+// In view: acquire lease
+let lease = try await store.lease("page_001.jpg", from: archiveURL)
+let localFileURL = lease.url
+
+// On cell reuse / scroll offscreen:
+await lease.release()
+```
+
+### Stream from Network Payloads
+
+Read chapters directly from `Data` without touching disk:
+
+```swift
+import ZipMelloConsumers
+
+let (data, _) = try await URLSession.shared.data(from: chapterURL)
+let comic = try await LocalComicArchive.open(data: data)
+let firstPage = try await comic.bytes(at: 0)
+```
+
+## Universal CLI
+
+ZipMello also includes a universal CLI binary (`zipmello`) for inspecting, extracting, and validating archives from the terminal:
+
+```bash
+zipmello list /path/to/archive.cbz
+zipmello info /path/to/archive.zip
+zipmello validate /path/to/archive.zip
+```
+
+Pre-built universal binaries (`arm64` + `x86_64`) are available on the [Releases](https://github.com/ChrisRodStar/zipmello/releases) page.
 
 ## Installation
 
@@ -12,11 +116,11 @@ Add ZipMello to your `Package.swift`:
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/ChrisRodStar/zipmello.git", branch: "main")
+    .package(url: "https://github.com/ChrisRodStar/zipmello.git", from: "1.0.0")
 ]
 ```
 
-Add `ZipMello` (and optionally `ZipMelloConsumers` for page caching and comic metadata) to your target:
+Add the core engine and reader consumers to your target:
 
 ```swift
 .target(
@@ -28,89 +132,16 @@ Add `ZipMello` (and optionally `ZipMelloConsumers` for page caching and comic me
 )
 ```
 
----
-
-## Quickstart
-
-### Read Entry
-```swift
-import ZipMello
-
-let data = try await ArchiveReader.read(entry: "chapter/001.jpg", from: archiveURL)
-```
-
-### Extract Archive
-```swift
-import ZipMello
-
-try await ArchiveReader.extractAll(from: archiveURL, to: destinationFolder)
-```
-
-### Create Archive
-```swift
-import ZipMello
-
-try await ArchiveWriter.create(at: archiveURL, from: sourceDirectory)
-```
-
----
-
-## Capabilities
-
-- **Hardware-Accelerated CRC32**: Vector-accelerated checksum calculations via Darwin `crc32`.
-- **Streaming DEFLATE Codec**: Stream compression and decompression using system `zlib`.
-- **Parallel Reads**: Independent positional reads (`pread`) across parallel reader lanes without seek cursor locks.
-- **ZIP64 Support**: Automatic ZIP64 EOCD Record and Locator generation for entry counts $\ge 65,535$ or sizes $\ge 4\text{GB}$.
-- **Security Validation**: Zip Slip protection, symlink rejection, and checksum verification.
-
----
-
-## Command Line Tool (`zipmello`)
-
-```bash
-# Inspect entry metadata & compression ratios
-swift run zipmello list /path/to/archive.zip
-
-# Show archive summary
-swift run zipmello info /path/to/archive.zip
-
-# Extract archive contents
-swift run zipmello extract /path/to/archive.zip /path/to/destination
-
-# Create compressed archive from a directory
-swift run zipmello create /path/to/source_dir /path/to/output.zip
-
-# Verify CRC32 checksums
-swift run zipmello validate /path/to/archive.zip
-```
-
----
-
-## Performance Comparison
-
-Side-by-side real-world benchmark comparison measured on Apple Silicon (arm64, Release `-O` builds):
-
-| Real-World Workload | ZIPFoundation | ZipMello | Advantage |
-| :--- | :--- | :--- | :--- |
-| **Random-Access Page Reads** *(80 pages from .cbz)* | 17.0 ms | **3.2 ms** | **5.31× faster** (81% less time) |
-| **Concurrent Reads** *(32 parallel decoders/workers)* | 7.1 ms | **1.4 ms** | **4.93× faster** (80% less time) |
-| **In-Memory Extraction** *(50 entries, zero disk I/O)* | 6.3 ms | **2.0 ms** | **3.15× faster** (68% less time) |
-| **Package Directory Extraction** *(500 files, 50 MB to disk)* | 83.2 ms | **40.0 ms** | **2.08× faster** (52% less time) |
-| **TOC / Directory Inspection** *(5,000 entries)* | 14.2 ms | **8.0 ms** | **1.78× faster** (44% less time) |
-| **Folder Archiving** *(500 files, 50 MB, DEFLATE)* | 120.4 ms | **110.1 ms** | **1.10× faster** (9% less time) |
-| **Full Test Suite Execution** | 32.60 s | **0.75 s** | **43.5× faster** |
-
-### Why ZipMello Is Faster in Real-World Apps
-
-- **Zero-Alloc Unaligned Hardware Access**: Central directory and local header parsing uses single-instruction `loadUnaligned` hardware memory operations, avoiding intermediate data copies and heap allocations.
-- **$O(1)$ Direct Offset Random Access**: Instead of scanning entries sequentially from disk, `ArchiveReader` indexes pre-computed payload offsets and reads slices directly using POSIX `pread`.
-- **True Swift 6 Actor Concurrency**: Multiple UI collection cells or background threads can read different pages from the same open archive concurrently through isolated actor lanes, without serial locking bottlenecks.
-- **Pure In-Memory Processing**: `ArchiveMemoryReader` parses and decompresses downloaded network payloads directly from RAM without touching disk or spooling temporary files.
-- **Hardware-Vector CRC32 & Direct DEFLATE**: CRC32 calculation delegates to hardware vector extensions (ARMv8 / SSE4.2), while streaming raw DEFLATE (`-15 windowBits`) pipelines directly between buffers.
-
----
-
 ## Documentation
 
-- [API Usage Guide](docs/USAGE.md)
+- [Complete API Usage Guide](docs/USAGE.md)
 - [Architecture & Engine Design](docs/ARCHITECTURE.md)
+
+## License
+
+ZipMello is open source software released under the [MIT License](LICENSE).
+
+<p align="center">
+  <img src="assets/branding/logo-128.png" width="48" height="48" alt="ZipMello Mascot"><br>
+  <sub>Crafted with care by Melo.</sub>
+</p>
