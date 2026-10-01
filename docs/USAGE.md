@@ -1,63 +1,123 @@
-# API usage
+# API Usage Guide
 
-## Read and install
+ZipMello provides both high-level convenience extensions and structured actor APIs for archive reading, extraction, streaming, and creation.
+
+---
+
+## 1. Archive Reading
+
+### Single-Line Reading
+Read entry data in one call:
 
 ```swift
 import ZipMello
 
-let reader = try await ArchiveReader.open(chapterURL)
+let data = try await ArchiveReader.read(entry: "chapter/001.jpg", from: archiveURL)
+```
+
+### Actor-Based Reading
+Open an archive for repeated entry reads:
+
+```swift
+import ZipMello
+
+let reader = try await ArchiveReader.open(archiveURL)
 let members = try await reader.listing()
-let bytes = try await reader.read("001.jpg", lookup: .compatible)
-try await reader.extractAll(to: newStagingDirectory)
+
+for member in members {
+    let data = try await reader.read(member.path)
+    print("Read \(member.path) (\(data.count) bytes)")
+}
+
 await reader.close()
-
-// One executor hop per downloaded response, no temporary ZIP.
-let page = try await ArchiveMemoryService.shared.read(
-    "chapter.md", data: responseData, limits: .sourcePages
-)
-
-// For batch access on your own bounded worker, index immutable bytes once.
-let memory = try ArchiveMemoryReader(data: responseData)
-let firstPage = try memory.read("001.jpg")
 ```
 
-Exact lookup is the default on file readers. `.compatible` prefers an exact match, then handles leading `./`, case/Unicode normalization, and safe percent-decoded aliases. Ambiguous fallback names throw. Extraction uses validated raw names with harmless leading `./` removed, never lookup aliases. Tree extraction rejects file/directory conflicts and case/Unicode destination collisions before creating staging.
-
-`consume(_:consumer:)` streams expanded chunks; `validate(progress:)` checks every file without retaining expanded data. Chunks are unverified until the operation successfully returns, so stream consumers must stage side effects. `read` returns a whole member; use streaming or file extraction for large data.
-
-## Export and progress
+### In-Memory Archive Reading
+Read directly from `Data` buffers without writing to disk:
 
 ```swift
-try await ArchiveWriter().create(
-    at: exportURL, directory: chapterDirectory,
-    compression: .stored, progress: progressHandler
-)
+import ZipMello
+
+let reader = try ArchiveMemoryReader(data: zipData, lookup: .compatible)
+let data = try reader.read("chapter/001.jpg")
 ```
 
-Directory export strips the parent, naturally orders children, includes nested/empty directories, and retains hidden metadata by default. The CLI opts to skip hidden files. Explicit ordered `.bytes`, `.file`, and `.directory` assets remain available, with stored/Deflate selection per file. Progress callbacks run synchronously on workers; UI callers should throttle updates and hop to their UI actor.
-
-Destinations need an existing parent and must not exist. Single-file extraction and ZIP creation synchronize before publication by default. Disposable page-cache files use `.buffered` extraction. Whole-tree extraction closes all files before publishing but does not fsync every file or claim crash-durable directory commits. Consumers validate source/model contents before replacing an installed generation.
-
-## Reader file ownership
+### Compatible Path Lookup
+Lookup mode `.compatible` handles case variations, unicode normalization, leading `./`, and percent-encoded filenames:
 
 ```swift
-let pages = try ArchivePageStore(directory: cacheRoot)
-let chapter = try await pages.session(for: chapterURL)
-let lease = try await chapter.lease("001.jpg")
-// Keep lease alive for all consumers that need its URL.
+// Matches "OEBPS/Cover.PNG", "oebps/cover.png", or "./OEBPS/cover.png"
+let data = try await reader.read("oebps/cover.png", lookup: .compatible)
+```
+
+---
+
+## 2. Extraction & Creation
+
+### Single-Line Extraction
+```swift
+import ZipMello
+
+// Extract all entries into a folder
+try await ArchiveReader.extractAll(from: archiveURL, to: destinationFolder)
+
+// Extract a single file
+try await ArchiveReader.extract(entry: "chapter/001.jpg", from: archiveURL, to: destinationFile)
+```
+
+### Single-Line Archive Creation
+```swift
+import ZipMello
+
+// Compress a directory into a ZIP archive
+try await ArchiveWriter.create(at: outputZipURL, from: inputDirectoryURL, compression: .deflate)
+```
+
+### Structured Asset Creation
+Build custom archives with mixed memory, file, and directory assets:
+
+```swift
+import ZipMello
+
+let assets: [ArchiveAsset] = [
+    .init(path: "001.jpg", content: .file(pageURL), compression: .deflate),
+    .init(path: "metadata.json", content: .bytes(jsonData), compression: .stored),
+    .init(path: "subfolder/", content: .directory)
+]
+
+try await ArchiveWriter.create(at: outputZipURL, assets: assets)
+```
+
+---
+
+## 3. High-Level Consumers (`ZipMelloConsumers`)
+
+### Page Session Cache (`ArchivePageStore`)
+Coalesces concurrent requests and bounds extracted files with explicit leases:
+
+```swift
+import ZipMelloConsumers
+
+let store = try ArchivePageStore(directory: cacheDirectory)
+let session = try await store.session(for: archiveURL)
+let lease = try await session.lease("001.jpg")
+
+// Use extracted file at lease.url
+print("Extracted page at: \(lease.url.path)")
+
 await lease.release()
-await pages.removeAll()
 ```
 
-The store coalesces concurrent requests and bounds cached files, active leases, in-flight bytes, and extractions. Clearing retires active files; they remain readable until release. Explicit release avoids deferred cleanup tasks. A chapter session represents an immutable archive generation and avoids repeated fingerprint checks on cache hits; reopen it when replacing the archive. The URL-based `lease(_:from:)` convenience fingerprints each acquisition. Melloku still owns shared chapter references and source-archive deletion policy.
+### Comic Archives & Metadata (`LocalComicArchive`)
+Parse comic book archives (CBZ), natural page order, and `ComicInfo.xml` metadata:
 
-## Consumer adapters and limits
+```swift
+import ZipMelloConsumers
 
-`LocalComicArchive` provides lazy image/text pages, natural order, hidden/description filtering, nested ComicInfo lookup, first-image cover bytes, and one-based `N.desc.txt` mapping. `ComicInfoCodec` round-trips flat metadata and page attributes, including fractional numbers and identity notes. It accepts UTF-8 and BOM-marked UTF-16, rejects DTD/entity declarations, and limits metadata to 4 MiB. Image decoding and chapter database changes remain in Melloku.
+let comic = try await LocalComicArchive.open(cbzURL)
+print("Page count: \(comic.pageCount)")
 
-`ArchivePackageInstaller` extracts a staged nested source/model tree. `DictionaryArchivePreflight` checks every member's CRC and expansion budgets, then validates an index title when present before native conversion. It does not replace Hoshi dictionary conversion, CoreML compilation, or their app installation transactions.
-
-Default budgets remain 512 MiB physical ZIP, 250 MiB per member, 2 GiB declared expansion, and 20,000 entries. `.sourcePages` preserves Melloku's decimal 64,000,000-byte input and 32,000,000-byte member caps; `.sourcePackages` caps input/expansion at 64,000,000 bytes. Opt-in `.models` and `.dictionaries` profiles allow larger installations with finite budgets. All profiles are configurable; representative fixture sizes, available disk, and app policy determine the final installation allowance.
-
-Apple streaming remains the default. Four read lanes and bounded libdeflate are explicit workload choices. The bulk writer supports ZIP64 directory counts/offsets and rejects individual members at the 32-bit size boundary. ZIP64 local descriptors and zero-size/zero-offset central fields have independent interoperability fixtures; multi-gigabyte member writing is outside the audited app requirements. RAR/CBR, password encryption, archive mutation, and EPUB interpretation are not supplied.
-
+if let coverData = try await comic.coverData() {
+    print("Cover size: \(coverData.count) bytes")
+}
+```

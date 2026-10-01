@@ -1,41 +1,66 @@
-# Archive ownership and consumer boundaries
+# Architecture & Engine Design
 
-`ArchiveReader` builds a validated path index once and stores immutable, Sendable descriptors: offsets, sizes, compression method, and CRC. ZIPFoundation's mutable archive cursor is released after parsing. A single read-only Swift System file descriptor supplies positional reads. Its immutable owner closes it when the last reader/operation releases it. File identity and timestamps are checked against the path and descriptor around parsing. Archives must remain immutable for the remainder of a session.
+ZipMello is engineered for high performance, memory efficiency, and thread safety on Apple platforms.
 
-A dedicated `DispatchSerialQueue` supplies each actor's serial executor. Default reads execute on the reader's queue; optional two/four-lane readers use dedicated queue-backed actors sharing the same positional descriptor and index. They never share a seek cursor, duplicate the index, or block Swift's cooperative executor. In-memory output reserves its validated size; input chunks adopt allocated storage without an extra initialization/copy. Reads return encoded bytes, not decoded images.
+---
 
-`ArchiveSessionPool` coalesces same-path opens, fingerprints device/inode/size/modification/change times, evicts by recency, and caps cached sessions and estimated index weight. Distinct in-flight opens are also bounded; saturation returns `sessionCapacityExceeded` so a caller can back off. The index accounting is a conservative model, not a hard allocator/RSS cap. Eviction or pool clearing releases ownership rather than forcibly closing a reader used by another operation. In-flight operations retain the file descriptor. These are descriptor leases, not Melloku's application-level chapter references or extracted-file leases.
+## Subsystem Overview
 
-Opening validates paths, duplicate names, entry count, physical archive size, per-entry expanded size, total declared expansion, supported compression, encryption rejection, and payload ranges. Parsed directory count must equal the declared count. Symlinks are rejected. Extraction checks actual emitted bytes, exact expanded length, and CRC. Indexing is not an extracted-data cache.
+```
++------------------------------------------------------------------+
+|                          Public APIs                             |
+|  ArchiveReader  |  ArchiveWriter  |  ArchivePageStore  |  CLI   |
++------------------------------------------------------------------+
+                                  |
+                                  v
++------------------------------------------------------------------+
+|                    Native Codec Subsystem                        |
+|                                                                  |
+|  +------------------------+      +----------------------------+  |
+|  | ZipCentralDirectory    |      | ZipDeflateEngine           |  |
+|  | Parser (Tail Scanner)  |      | (Streaming zlib)           |  |
+|  +------------------------+      +----------------------------+  |
+|  | ZipChecksum            |      | ZipBinaryWriter            |  |
+|  | (Darwin libz CRC32)    |      | (ZIP & ZIP64 Binary)       |  |
+|  +------------------------+      +----------------------------+  |
++------------------------------------------------------------------+
+                                  |
+                                  v
++------------------------------------------------------------------+
+|                    System Infrastructure                         |
+|  Swift System FileDescriptor  |  Darwin libz  |  Dispatch Queues |
++------------------------------------------------------------------+
+```
 
-`ArchiveWriter` validates ordered assets, opens file inputs with no-follow semantics, confirms size/type on the descriptor, reads sequentially, and rejects source size/timestamp changes observed after writing. `BulkArchiveWriter` writes local records/data, patches their headers, then writes the central directory once. It supports ZIP64 directory counts/offsets; entries of 4 GiB or larger are deliberately unsupported by this creation path. Default Melloku entry limits are 250 MiB. Standard stored and raw-DEFLATE records remain interoperable with ZIPFoundation and system unzip.
+---
 
-A unique sibling staging file is moved into place only after completion, checksums, budgets, and synchronization. Existing destinations are never replaced. Output payload budgets are checked per emitted chunk and directory sizes during finalization. Small headers/records can transiently exceed the cap before a failure removes staging. This is not a crash-durable directory transaction. No part of a failed archive is published.
+## Component Architecture
 
-Apple streaming compression remains the default. An explicitly selected libdeflate path is limited to both compressed and expanded inputs within at most 4 MiB; larger reads/writes fall back to streaming. Compressors/decompressors are owned by each operation. This experiment trades additional bounded memory and a C dependency for workload-dependent speed; it is not a universal replacement.
+1. **`ZipCentralDirectoryParser`**
+   - Scans the End of Central Directory (EOCD) from the tail of the file (up to 66 KiB from EOF).
+   - Parses ZIP64 EOCD Record (`0x06064b50`) and Locator (`0x07064b50`) when entry counts $\ge 65,535$ or offsets $\ge 4\text{GB}$.
+   - Decodes UTF-8 (`0x0800` bit 11) and CP437 legacy filename encodings.
 
-Default reader buffers remain 64 KiB and read concurrency remains one. Export defaults are 256 KiB based on the release sweep. `ArchiveTuning.pagePrefetch` selects four lanes; `smallEntries` opts into bounded libdeflate. Callers should bound outstanding requests and retained output bytes, independently of the lane count. Use streaming file extraction for large members. A pool never shares extracted page bytes or stores application metadata.
+2. **`ZipDeflateEngine`**
+   - High-throughput streaming raw DEFLATE (RFC 1951) compressor and decompressor using system `zlib` (`inflateInit2_` & `deflateInit2_` with `windowBits = -15`).
+   - Uses zero-copy reusable scratch buffers (`UnsafeMutableRawBufferPointer`) to eliminate Swift `Data` reallocations per chunk.
 
-## Melloku consumers
+3. **`ZipChecksum`**
+   - Hardware-accelerated 32-bit CRC checksum engine calling Darwin `libz` (`crc32`).
+   - Validates payload integrity during streaming decompression and extraction.
 
-| Stage | Required contract | Ownership outside this library |
-| --- | --- | --- |
-| 03 | Inspect/extract source ZIP Payload and prepare staged installation | Manifest/Wasm validation and repository commit |
-| 04 | Local CBZ/ZIP listing, natural page order, lazy entries, metadata and descriptions | ComicInfo parsing, file scopes, library identity and shared chapter references |
-| 06 | Stream pages/ComicInfo into CBZ, import existing downloads, support failed/cancelled writes | Download queue, retries, manifests, promotion and storage accounting |
-| 07–08 | Reuse archive sessions, memoize extracted entries, return leased files, unpack model ZIPs | Reader prefetch, image processing, model validation/compilation and cache policy |
-| 09 | Validate dictionary ZIPs under budgets before native import | Dictionary format conversion, native handles and installation generations |
+4. **`ZipBinaryWriter`**
+   - Streaming binary encoder writing Local Headers (`0x04034b50`), Stored/DEFLATE entry payloads, Central Directory records (`0x02014b50`), EOCD footers, and ZIP64 structures.
 
-Stage 11's JSON/binary-plist backup requirements add no ZIP consumer. Stage 04 explicitly supports CBZ/ZIP; summary mentions of CBR do not establish RAR support. Melloku's specifications remain the source of truth in `/Users/chris/Desktop/Workspace/Products/Melloku/docs/parity`. This package supplies archive mechanisms, not complete implementations of every stage.
+---
 
-## Replacement APIs added October 1, 2026
+## Concurrency & Memory Safety
 
-The immutable `ValidatedArchiveIndex` is shared by file and memory readers. `ArchiveMemoryReader` supports synchronous batches on bounded workers; `ArchiveMemoryService` reuses one executor and indexes/reads in one hop for remote responses. `ArchiveReader.open(data:)` remains available for callers needing its asynchronous session APIs. Compatible aliases are built lazily for file readers, and memory fallback scans only when an exact path is absent.
-
-`ArchiveTreePlan` resolves harmless leading dot prefixes, all explicit/implicit directories, and conservative case/Unicode destination conflicts before extraction. A single worker streams a new private tree using Swift System `FileDescriptor.writeAll`; per-file fsync is avoided for tree extraction, which does not promise crash-durable installation. Model/source coordinators own validation and replacement. ZIP export still syncs its completed staged archive.
-
-`ArchivePageStore` supplies bounded reservations, request coalescing, cached-file LRU, and idempotent file leases. Pending waiters pin an entry until they acquire it, avoiding eviction between shared extraction completion and lease delivery. Clearing advances an epoch, cancels pending extractions and retires leased files. `ArchivePageSession` identifies an immutable chapter generation; URL convenience calls fingerprint each time. Source-archive/chapter deletion policy stays with Melloku.
-
-The creation API now supports directory assets and recursive enumeration, including empty directories and download metadata. Streamed progress is synchronous and optional. `ZipMelloConsumers` isolates ComicInfo/local-comic selection, model/source extraction convenience, and native dictionary preflight from the archive codec.
-
-The vendored reader detects a streamed ZIP64 descriptor from local size reservation even when final central sizes fit 32 bits. Descriptor metadata must agree with the central record. ZIP64 effective central fields now preserve valid zero sizes/offsets. Independent Python fixtures cover those cases and signed/unsigned descriptors; reference clones remain unchanged.
+- **Swift Concurrency Actors**: High-level types (`ArchiveReader`, `ArchiveWriter`, `ArchiveMemoryService`) are actors backed by dedicated `DispatchSerialQueue` executors (`UnownedSerialExecutor`).
+- **Positional `pread` I/O**: Multi-lane reader instances perform non-blocking positional reads (`FileDescriptor.read(fromAbsoluteOffset:into:)`) from a single shared file descriptor without seek cursor locks.
+- **Atomic Staging**: Extraction and creation operations write payload chunks to isolated hidden staging files (`.extract-...` or `.archive-...`) and atomically replace the destination path only after CRC and size validation succeed.
+- **Resource Limits (`ArchiveLimits`)**:
+  - Maximum Archive Size (default: 512 MB)
+  - Maximum Entry Size (default: 250 MB)
+  - Maximum Expanded Size (default: 2 GB)
+  - Maximum Entry Count (default: 20,000)

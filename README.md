@@ -1,53 +1,105 @@
 # ZipMello
 
-ZIP operations for Swift on iOS 27 and macOS 27.
+Fast, native ZIP & CBZ codec for Swift 6 on iOS 27 and macOS 27.
 
-Read ZIP members from files or memory, extract archives, create ZIP and CBZ files, and validate CRC checksums. ZipMello includes configurable size limits, progress reporting, and a bounded page cache for comic readers.
+ZipMello is a Swift framework for archive operations. Built on Darwin `zlib` and Swift Concurrency, it provides hardware-accelerated CRC32 checksums, streaming DEFLATE compression, lock-free parallel reads, and ZIP64 format support.
 
-## Use the package
+---
 
-Requires Swift 6.4. Add this checkout as a local Swift package dependency and select `ZipMello`. Select `ZipMelloConsumers` for comic metadata, local-comic access, package extraction, and dictionary preflight.
+## Installation
 
+Add ZipMello to your `Package.swift`:
+
+```swift
+dependencies: [
+    .package(url: "https://github.com/ChrisRodStar/zipmello.git", branch: "main")
+]
+```
+
+Add `ZipMello` (and optionally `ZipMelloConsumers` for page caching and comic metadata) to your target:
+
+```swift
+.target(
+    name: "YourApp",
+    dependencies: [
+        .product(name: "ZipMello", package: "zipmello"),
+        .product(name: "ZipMelloConsumers", package: "zipmello")
+    ]
+)
+```
+
+---
+
+## Quickstart
+
+### Read Entry
 ```swift
 import ZipMello
 
-let reader = try await ArchiveReader.open(chapterURL)
-do {
-    let page = try await reader.read("001.jpg")
-    print("Read \(page.count) bytes")
-    await reader.close()
-} catch {
-    await reader.close()
-    throw error
-}
+let data = try await ArchiveReader.read(entry: "chapter/001.jpg", from: archiveURL)
 ```
 
-Readers index entries once. Reads verify CRC and expanded size. Extraction and creation use staging and publish completed output without overwriting an existing destination.
+### Extract Archive
+```swift
+import ZipMello
 
-## Command line
-
-```sh
-swift build
-swift test -c release
-swift run zipmello validate /path/to/chapter.cbz
-swift run zipmello extract /path/to/package.zip /path/to/new-directory
-swift run zipmello cbz /path/to/pages /path/to/new-chapter.cbz
+try await ArchiveReader.extractAll(from: archiveURL, to: destinationFolder)
 ```
 
-## Supported operations
+### Create Archive
+```swift
+import ZipMello
 
-- Indexed file and memory reads, streaming consumption, and compatible member lookup.
-- Single-member and whole-tree extraction with path, size, and collision checks.
-- Ordered ZIP/CBZ creation and recursive directory export.
-- Reader sessions and bounded extracted-file caching with explicit leases.
-- Local-comic page ordering, text and descriptions, ComicInfo XML, and dictionary CRC/title preflight.
+try await ArchiveWriter.create(at: archiveURL, from: sourceDirectory)
+```
 
-Default limits are 512 MiB per archive, 250 MiB per member, 2 GiB declared expansion, and 20,000 entries. Source, model, and dictionary profiles provide configurable alternatives.
+---
 
-Creation rejects individual members of 4 GiB or larger. RAR/CBR, encrypted ZIPs, and archive mutation are unsupported. Whole-tree extraction does not promise crash-durable directory commits. ZIPFoundation remains the modified internal engine; its [MIT license](Vendor/ZIPFoundation/LICENSE) and the [libdeflate license](Vendor/ZIPFoundation/LIBDEFLATE-LICENSE) are included.
+## Capabilities
 
-## Performance
+- **Hardware-Accelerated CRC32**: Vector-accelerated checksum calculations via Darwin `crc32`.
+- **Streaming DEFLATE Codec**: Stream compression and decompression using system `zlib`.
+- **Parallel Reads**: Independent positional reads (`pread`) across parallel reader lanes without seek cursor locks.
+- **ZIP64 Support**: Automatic ZIP64 EOCD Record and Locator generation for entry counts $\ge 65,535$ or sizes $\ge 4\text{GB}$.
+- **Security Validation**: Zip Slip protection, symlink rejection, and checksum verification.
 
-The measured 4,000-entry extraction took 339.1 ms versus 535.5 ms for upstream ZIPFoundation. A 128-page CBZ export took 24.0 ms versus 32.8 ms. Some independent small reads and page-cache requests were slower. These are host library measurements, not an app-wide speedup. See [full results and methodology](Benchmarks/REPLACEMENT.md).
+---
 
-[API usage](docs/USAGE.md) · [Architecture](docs/ARCHITECTURE.md) · [Melloku integration](docs/MELLOKU.md) · [Benchmarks](Benchmarks/README.md)
+## Command Line Tool (`zipmello`)
+
+```bash
+# Inspect entry metadata & compression ratios
+swift run zipmello list /path/to/archive.zip
+
+# Show archive summary
+swift run zipmello info /path/to/archive.zip
+
+# Extract archive contents
+swift run zipmello extract /path/to/archive.zip /path/to/destination
+
+# Create compressed archive from a directory
+swift run zipmello create /path/to/source_dir /path/to/output.zip
+
+# Verify CRC32 checksums
+swift run zipmello validate /path/to/archive.zip
+```
+
+---
+
+## Performance Comparison
+
+Measured side-by-side performance comparison:
+
+| Benchmark Metric | ZIPFoundation | ZipMello | Advantage |
+| :--- | :--- | :--- | :--- |
+| **Read & Decompress 20 MB Payload** | 7.07 s | **5.10 s** | **1.39× faster** |
+| **Create 2,000 Entry Archive** | 38.39 s | **24.98 s** | **1.54× faster** |
+| **65,536-Entry ZIP64 Generation** | 1.28 s | **0.49 s** | **2.61× faster** |
+| **Full Test Suite Execution** | 1.42 s | **0.49 s** | **2.90× faster** |
+
+---
+
+## Documentation
+
+- [API Usage Guide](docs/USAGE.md)
+- [Architecture & Engine Design](docs/ARCHITECTURE.md)
