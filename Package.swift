@@ -16,7 +16,7 @@ let package = Package(
         .executable(name: "zipmello", targets: ["ZipMelloCLI"])
     ],
     dependencies: [
-        .package(url: "https://github.com/apple/swift-system", exact: "1.8.1")
+        .package(url: "https://github.com/apple/swift-system", "1.4.0"..<"1.7.0")
     ],
     targets: [
         .target(name: "ZipMello", dependencies: [.product(name: "SystemPackage", package: "swift-system")]),
