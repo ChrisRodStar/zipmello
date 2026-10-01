@@ -312,4 +312,26 @@ extension ArchiveTests {
         }
         #expect(try FileManager.default.contentsOfDirectory(atPath: work.root.path).isEmpty)
     }
+
+    @Test
+    func convenienceAPIsWorkAsExpected() async throws {
+        let work = try Workspace()
+        let zipURL = work.file("convenience.zip")
+        let assetData = Data("convenience payload".utf8)
+        
+        try await ArchiveWriter.create(at: zipURL, assets: [
+            .init(path: "test.txt", content: .bytes(assetData))
+        ])
+
+        let readData = try await ArchiveReader.read(entry: "test.txt", from: zipURL)
+        #expect(readData == assetData)
+
+        let extractURL = work.file("extracted.txt")
+        try await ArchiveReader.extract(entry: "test.txt", from: zipURL, to: extractURL)
+        #expect(try Data(contentsOf: extractURL) == assetData)
+
+        let folderURL = work.file("out_folder")
+        try await ArchiveReader.extractAll(from: zipURL, to: folderURL)
+        #expect(try Data(contentsOf: folderURL.appendingPathComponent("test.txt")) == assetData)
+    }
 }
