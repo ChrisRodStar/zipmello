@@ -1,6 +1,6 @@
 # ZipMello
 
-Fast, native ZIP & CBZ codec for Swift 6 on iOS 27 and macOS 27.
+Fast, native ZIP & CBZ codec for Swift 6 on iOS 18+ and macOS 15+ (also supporting tvOS 18+, watchOS 11+, and visionOS 2+).
 
 ZipMello is a Swift framework for archive operations. Built on Darwin `zlib` and Swift Concurrency, it provides hardware-accelerated CRC32 checksums, streaming DEFLATE compression, lock-free parallel reads, and ZIP64 format support.
 
