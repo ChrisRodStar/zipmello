@@ -1,54 +1,118 @@
 import Foundation
 import Dispatch
 
-/// Immutable byte-backed index for batch reads without actor hops between members.
-/// Call from a bounded archive worker; initialization/extraction are synchronous.
+/// Immutable in-memory reader designed for synchronous, low-overhead member extraction.
+///
+/// `ArchiveMemoryReader` operates directly over a pre-loaded `Data` buffer without requiring
+/// a backing file on disk or actor hops between member reads. It is ideally suited for network-downloaded
+/// ZIP archives, embedded application resources, and batch comic page decoding.
 public struct ArchiveMemoryReader: Sendable {
     private let validated: ValidatedArchiveIndex
     private let worker: ArchiveReadWorker
     private let lookup: ArchiveLookup
 
-    public init(data: Data, limits: ArchiveLimits = .init(), tuning: ArchiveTuning = .init(), lookup: ArchiveLookup = .exact) throws {
-        try limits.validate(); try tuning.validate(); try Task.checkCancellation()
-        guard UInt64(data.count) <= limits.maximumArchiveBytes else { throw ArchiveFailure.archiveTooLarge }
+    /// Initializes an in-memory archive reader by validating the central directory.
+    ///
+    /// - Parameters:
+    ///   - data: In-memory byte buffer containing the complete ZIP archive.
+    ///   - limits: Resource constraints governing maximum file sizes and member counts.
+    ///   - tuning: Buffer size and decompression settings.
+    ///   - lookup: Member lookup strategy (exact match or forgiving normalized path aliases).
+    public init(
+        data: Data,
+        limits: ArchiveLimits = .init(),
+        tuning: ArchiveTuning = .init(),
+        lookup: ArchiveLookup = .exact
+    ) throws {
+        try limits.validate()
+        try tuning.validate()
+        try Task.checkCancellation()
+
+        guard UInt64(data.count) <= limits.maximumArchiveBytes else {
+            throw ArchiveFailure.archiveTooLarge
+        }
+
         let parser = try ZipCentralDirectoryParser.parse(input: .bytes(data))
-        validated = try ValidatedArchiveIndex(parser: parser, input: .bytes(data), bytes: UInt64(data.count), limits: limits)
+        validated = try ValidatedArchiveIndex(
+            parser: parser,
+            input: .bytes(data),
+            bytes: UInt64(data.count),
+            limits: limits
+        )
         worker = ArchiveReadWorker(input: .bytes(data), limits: limits, tuning: tuning)
         self.lookup = lookup
     }
 
-    public func listing() -> [ArchiveMember] { validated.members }
+    /// Returns the verified manifest of entries contained within the in-memory archive.
+    public func listing() -> [ArchiveMember] {
+        validated.members
+    }
 
+    /// Synchronously reads and decompresses an archive entry by path.
+    ///
+    /// - Parameter path: Archive member path, matching either exact central directory naming
+    ///   or compatible alias conventions when `lookup` is `.compatible`.
+    /// - Returns: Complete uncompressed bytes for the requested member.
     public func read(_ path: String) throws -> Data {
         try Task.checkCancellation()
-        var resolved = path
+
+        var resolvedPath = path
         if validated.index[path] == nil, lookup == .compatible {
             let key = ArchivePath.alias(try ArchivePath.canonical(path))
-            var match: String?
+            var singleMatch: String?
+
             for member in validated.members where !member.isDirectory {
                 let canonical = try ArchivePath.canonical(member.path)
                 let decoded = canonical.removingPercentEncoding
-                let decodedMatch = decoded.map { (try? ArchivePath.validate($0)) != nil && ArchivePath.alias($0) == key } ?? false
+                let decodedMatch = decoded.map {
+                    (try? ArchivePath.validate($0)) != nil && ArchivePath.alias($0) == key
+                } ?? false
+
                 if ArchivePath.alias(canonical) == key || decodedMatch {
-                    guard match == nil else { throw ArchiveFailure.ambiguousEntry(path) }
-                    match = member.path
+                    guard singleMatch == nil else {
+                        throw ArchiveFailure.ambiguousEntry(path)
+                    }
+                    singleMatch = member.path
                 }
             }
-            resolved = match ?? path
+            resolvedPath = singleMatch ?? path
         }
-        guard let entry = validated.index[resolved] else { throw ArchiveFailure.missingEntry(path) }
-        return try worker.read(entry, path: resolved)
+
+        guard let entry = validated.index[resolvedPath] else {
+            throw ArchiveFailure.missingEntry(path)
+        }
+        return try worker.read(entry, path: resolvedPath)
     }
 }
 
-/// Reusable dedicated executor for downloaded archive responses; one hop per request.
+/// Dedicated serial actor service for safely dispatching in-memory archive decompression requests.
+///
+/// `ArchiveMemoryService` limits concurrency overhead when multiple tasks extract pages from
+/// downloaded archives simultaneously.
 public actor ArchiveMemoryService {
     public static let shared = ArchiveMemoryService()
+
     private nonisolated let executor = DispatchSerialQueue(label: "ZipMello.memory", qos: .userInitiated)
-    public nonisolated var unownedExecutor: UnownedSerialExecutor { executor.asUnownedSerialExecutor() }
+    public nonisolated var unownedExecutor: UnownedSerialExecutor {
+        executor.asUnownedSerialExecutor()
+    }
+
     public init() {}
-    public func read(_ path: String, data: Data, limits: ArchiveLimits = .sourcePages,
-                     lookup: ArchiveLookup = .compatible) throws -> Data {
+
+    /// Extracts an entry from an in-memory ZIP buffer with one actor hop.
+    ///
+    /// - Parameters:
+    ///   - path: Entry path to decompress.
+    ///   - data: In-memory byte buffer of the archive.
+    ///   - limits: Security constraints.
+    ///   - lookup: Member lookup strategy.
+    /// - Returns: Decompressed entry data.
+    public func read(
+        _ path: String,
+        data: Data,
+        limits: ArchiveLimits = .sourcePages,
+        lookup: ArchiveLookup = .compatible
+    ) throws -> Data {
         try ArchiveMemoryReader(data: data, limits: limits, lookup: lookup).read(path)
     }
 }

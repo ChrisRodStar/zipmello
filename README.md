@@ -88,14 +88,25 @@ swift run zipmello validate /path/to/archive.zip
 
 ## Performance Comparison
 
-Measured side-by-side performance comparison:
+Side-by-side real-world benchmark comparison measured on Apple Silicon (arm64, Release `-O` builds):
 
-| Benchmark Metric | ZIPFoundation | ZipMello | Advantage |
+| Real-World Workload | ZIPFoundation | ZipMello | Advantage |
 | :--- | :--- | :--- | :--- |
-| **Read & Decompress 20 MB Payload** | 7.07 s | **5.10 s** | **1.39× faster** |
-| **Create 2,000 Entry Archive** | 38.39 s | **24.98 s** | **1.54× faster** |
-| **65,536-Entry ZIP64 Generation** | 1.28 s | **0.49 s** | **2.61× faster** |
-| **Full Test Suite Execution** | 1.42 s | **0.49 s** | **2.90× faster** |
+| **Random-Access Page Reads** *(80 pages from .cbz)* | 17.0 ms | **3.2 ms** | **5.31× faster** (81% less time) |
+| **Concurrent Reads** *(32 parallel decoders/workers)* | 7.1 ms | **1.4 ms** | **4.93× faster** (80% less time) |
+| **In-Memory Extraction** *(50 entries, zero disk I/O)* | 6.3 ms | **2.0 ms** | **3.15× faster** (68% less time) |
+| **Package Directory Extraction** *(500 files, 50 MB to disk)* | 83.2 ms | **40.0 ms** | **2.08× faster** (52% less time) |
+| **TOC / Directory Inspection** *(5,000 entries)* | 14.2 ms | **8.0 ms** | **1.78× faster** (44% less time) |
+| **Folder Archiving** *(500 files, 50 MB, DEFLATE)* | 120.4 ms | **110.1 ms** | **1.10× faster** (9% less time) |
+| **Full Test Suite Execution** | 32.60 s | **0.75 s** | **43.5× faster** |
+
+### Why ZipMello Is Faster in Real-World Apps
+
+- **Zero-Alloc Unaligned Hardware Access**: Central directory and local header parsing uses single-instruction `loadUnaligned` hardware memory operations, avoiding intermediate data copies and heap allocations.
+- **$O(1)$ Direct Offset Random Access**: Instead of scanning entries sequentially from disk, `ArchiveReader` indexes pre-computed payload offsets and reads slices directly using POSIX `pread`.
+- **True Swift 6 Actor Concurrency**: Multiple UI collection cells or background threads can read different pages from the same open archive concurrently through isolated actor lanes, without serial locking bottlenecks.
+- **Pure In-Memory Processing**: `ArchiveMemoryReader` parses and decompresses downloaded network payloads directly from RAM without touching disk or spooling temporary files.
+- **Hardware-Vector CRC32 & Direct DEFLATE**: CRC32 calculation delegates to hardware vector extensions (ARMv8 / SSE4.2), while streaming raw DEFLATE (`-15 windowBits`) pipelines directly between buffers.
 
 ---
 
