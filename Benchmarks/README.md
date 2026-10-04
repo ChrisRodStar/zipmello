@@ -25,12 +25,12 @@ Measured on Apple Silicon (Apple M3, 8 GB RAM, macOS 15, Release `-O` build, war
 
 | Workload | ZIPFoundation 0.9.20 | ZipMello | Median Paired Speedup | Details |
 | :--- | ---: | ---: | ---: | :--- |
-| **Path Lookup by Name** | 11.47 ms ± 0.03 ms | **0.21 ms ± 0.00 ms** | **54.06×** | 80 path queries; ZipMello average $O(1)$ index vs ZIPFoundation stock $O(N)$ linear scans |
-| **Library Discovery** | 0.62 ms ± 0.01 ms | **0.29 ms ± 0.01 ms** | **2.17×** | Open archive + index central directory + extract cover + parse `ComicInfo.xml` |
-| **In-Memory Extraction (Stored)** | 0.81 ms ± 0.01 ms | **0.63 ms ± 0.01 ms** | **1.28×** | 50 stored pages read directly into preallocated buffer without chunking |
-| **In-Memory Decompression (DEFLATE)** | 43.51 ms ± 0.11 ms | **23.14 ms ± 0.08 ms** | **1.88×** | 50 DEFLATE pages decompressed into preallocated buffer via single-pass inflate |
-| **Concurrent Prefetching** | 0.26 ms ± 0.00 ms | 0.26 ms ± 0.00 ms | 0.99× | 32 simultaneous page extractions across 4 read lanes vs 4 independent archive handles |
-| **Random-Access Page Reads** | 1.77 ms ± 0.01 ms | 1.81 ms ± 0.01 ms | 0.98× | 80 page extractions into materialized `Data` with pre-indexed entries |
+| **Path Lookup by Name** | 11.46 ms ± 0.12 ms | **0.21 ms ± 0.00 ms** | **55.02×** | 80 path queries; ZipMello average $O(1)$ index vs ZIPFoundation stock $O(N)$ linear scans |
+| **Library Discovery** | 0.66 ms ± 0.01 ms | **0.28 ms ± 0.00 ms** | **2.33×** | Open archive + index central directory + extract cover + parse `ComicInfo.xml` |
+| **In-Memory Extraction (Stored)** | 0.90 ms ± 0.02 ms | **0.56 ms ± 0.02 ms** | **1.63×** | 50 stored pages read directly into uninitialized zero-copy buffer |
+| **In-Memory Decompression (DEFLATE)** | 44.18 ms ± 0.15 ms | **24.04 ms ± 0.18 ms** | **1.84×** | 50 DEFLATE pages decompressed into preallocated buffer via single-pass inflate |
+| **Concurrent Prefetching** | 0.26 ms ± 0.00 ms | **0.25 ms ± 0.01 ms** | **1.03×** | 32 simultaneous page extractions across 4 read lanes vs 4 independent archive handles |
+| **Random-Access Page Reads** | 1.95 ms ± 0.07 ms | **1.73 ms ± 0.02 ms** | **1.11×** | 80 page extractions directly from disk with pre-indexed entries |
 
 ---
 

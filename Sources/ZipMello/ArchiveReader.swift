@@ -77,11 +77,20 @@ final class ArchiveFile: Sendable {
             return Data()
         }
 
-        var data = Data(count: count)
-        try data.withUnsafeMutableBytes { target in
+        let storage = UnsafeMutableRawPointer.allocate(
+            byteCount: count,
+            alignment: MemoryLayout<UInt64>.alignment
+        )
+        do {
+            let target = UnsafeMutableRawBufferPointer(start: storage, count: count)
             try read(offset: offset, into: target)
+            return Data(bytesNoCopy: storage, count: count, deallocator: .custom { pointer, _ in
+                pointer.deallocate()
+            })
+        } catch {
+            storage.deallocate()
+            throw error
         }
-        return data
     }
 }
 
@@ -172,21 +181,25 @@ struct ArchiveReadWorker: Sendable {
                 return Data()
             }
 
-            // Direct single-pread fast path:
-            // 1. Allocate final Data once
-            // 2. pread directly into its mutable storage
-            // 3. CRC once across final buffer
-            // 4. Return Data
-            var output = Data(count: count)
-            let calculatedCRC = try output.withUnsafeMutableBytes { (rawBuffer: UnsafeMutableRawBufferPointer) -> UInt32 in
+            // Direct single-pread fast path without zero-initialization:
+            let storage = UnsafeMutableRawPointer.allocate(
+                byteCount: count,
+                alignment: MemoryLayout<UInt64>.alignment
+            )
+            do {
+                let rawBuffer = UnsafeMutableRawBufferPointer(start: storage, count: count)
                 try input.read(offset: entry.offset, into: rawBuffer)
-                return ZipChecksum.update(current: 0, buffer: UnsafeRawBufferPointer(rawBuffer))
+                let calculatedCRC = ZipChecksum.update(current: 0, buffer: UnsafeRawBufferPointer(rawBuffer))
+                guard calculatedCRC == entry.checksum else {
+                    throw ArchiveFailure.checksumMismatch(path)
+                }
+                return Data(bytesNoCopy: storage, count: count, deallocator: .custom { pointer, _ in
+                    pointer.deallocate()
+                })
+            } catch {
+                storage.deallocate()
+                throw error
             }
-
-            guard calculatedCRC == entry.checksum else {
-                throw ArchiveFailure.checksumMismatch(path)
-            }
-            return output
         }
 
         if entry.compression == .deflate,
@@ -201,15 +214,26 @@ struct ArchiveReadWorker: Sendable {
             }
 
             let compressed = try input.read(offset: entry.offset, count: Int(entry.compressedBytes))
-            var output = Data(count: count)
-            let calculatedCRC = try ZipDeflateEngine.decompressWholeBuffer(
-                compressed: compressed,
-                destination: &output
+            let storage = UnsafeMutableRawPointer.allocate(
+                byteCount: count,
+                alignment: MemoryLayout<UInt64>.alignment
             )
-            guard calculatedCRC == entry.checksum else {
-                throw ArchiveFailure.checksumMismatch(path)
+            do {
+                let dstBuffer = UnsafeMutableRawBufferPointer(start: storage, count: count)
+                let calculatedCRC = try ZipDeflateEngine.decompressWholeBuffer(
+                    compressed: compressed,
+                    destination: dstBuffer
+                )
+                guard calculatedCRC == entry.checksum else {
+                    throw ArchiveFailure.checksumMismatch(path)
+                }
+                return Data(bytesNoCopy: storage, count: count, deallocator: .custom { pointer, _ in
+                    pointer.deallocate()
+                })
+            } catch {
+                storage.deallocate()
+                throw error
             }
-            return output
         }
 
         var output = Data()
@@ -456,10 +480,11 @@ public actor ArchiveReader {
 
     /// Reads and decompresses the complete binary payload for an entry.
     public func read(_ path: String, lookup: ArchiveLookup = .exact) async throws -> Data {
-        let (entry, lane) = try select(path, lookup: lookup)
         if let inlineWorker {
+            let entry = try selectEntry(path, lookup: lookup)
             return try inlineWorker.read(entry, path: path)
         }
+        let (entry, lane) = try select(path, lookup: lookup)
         return try await lane.read(entry, path: path)
     }
 
@@ -470,11 +495,12 @@ public actor ArchiveReader {
         lookup: ArchiveLookup = .exact,
         durability: ArchiveDurability = .synchronized
     ) async throws {
-        let (entry, lane) = try select(path, lookup: lookup)
         if let inlineWorker {
+            let entry = try selectEntry(path, lookup: lookup)
             try inlineWorker.extract(entry, path: path, to: destination, durability: durability)
             return
         }
+        let (entry, lane) = try select(path, lookup: lookup)
         try await lane.extract(entry, path: path, to: destination, durability: durability)
     }
 
@@ -484,11 +510,12 @@ public actor ArchiveReader {
         lookup: ArchiveLookup = .exact,
         consumer: @Sendable (Data) throws -> Void
     ) async throws {
-        let (entry, lane) = try select(path, lookup: lookup)
         if let inlineWorker {
+            let entry = try selectEntry(path, lookup: lookup)
             try inlineWorker.consume(entry, path: path, consumer: consumer)
             return
         }
+        let (entry, lane) = try select(path, lookup: lookup)
         try await lane.consume(entry, path: path, consumer: consumer)
     }
 
@@ -672,7 +699,7 @@ public actor ArchiveReader {
         try fm.moveItem(at: staging, to: destination)
     }
 
-    private func select(_ path: String, lookup: ArchiveLookup) throws -> (ArchiveReadDescriptor, ArchiveReadLane) {
+    private func selectEntry(_ path: String, lookup: ArchiveLookup) throws -> ArchiveReadDescriptor {
         try Task.checkCancellation()
         guard !lanes.isEmpty else {
             throw ArchiveFailure.closed
@@ -684,6 +711,11 @@ public actor ArchiveReader {
             }
             throw ArchiveFailure.missingEntry(path)
         }
+        return entry
+    }
+
+    private func select(_ path: String, lookup: ArchiveLookup) throws -> (ArchiveReadDescriptor, ArchiveReadLane) {
+        let entry = try selectEntry(path, lookup: lookup)
         let lane = lanes[nextLane]
         nextLane = (nextLane + 1) % lanes.count
         return (entry, lane)

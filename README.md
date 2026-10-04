@@ -24,12 +24,12 @@ Measured head-to-head on Apple Silicon (Apple M3, Release mode) comparing ZipMel
 
 | Benchmark | ZIPFoundation 0.9.20 | ZipMello | Speedup |
 | :--- | ---: | ---: | ---: |
-| **Path Lookup by Name**<br><sub>80 lookups across chapter</sub> | 11.47 ms ± 0.03 ms | **0.21 ms ± 0.00 ms** | **54.06×** |
-| **Library Discovery**<br><sub>Open + Cover + ComicInfo.xml</sub> | 0.62 ms ± 0.01 ms | **0.29 ms ± 0.01 ms** | **2.17×** |
-| **In-Memory Extraction (Stored)**<br><sub>50 stored pages, zero disk I/O</sub> | 0.81 ms ± 0.01 ms | **0.63 ms ± 0.01 ms** | **1.28×** |
-| **In-Memory Decompression (DEFLATE)**<br><sub>50 compressed pages, single-pass inflate</sub> | 43.51 ms ± 0.11 ms | **23.14 ms ± 0.08 ms** | **1.88×** |
-| **Concurrent Prefetching**<br><sub>32 reads across 4 threads</sub> | 0.26 ms ± 0.00 ms | 0.26 ms ± 0.00 ms | 0.99× |
-| **Random-Access Page Reads**<br><sub>80 pages directly from disk</sub> | 1.77 ms ± 0.01 ms | 1.81 ms ± 0.01 ms | 0.98× |
+| **Path Lookup by Name**<br><sub>80 lookups across chapter</sub> | 11.46 ms ± 0.12 ms | **0.21 ms ± 0.00 ms** | **55.02×** |
+| **Library Discovery**<br><sub>Open + Cover + ComicInfo.xml</sub> | 0.66 ms ± 0.01 ms | **0.28 ms ± 0.00 ms** | **2.33×** |
+| **In-Memory Extraction (Stored)**<br><sub>50 stored pages, zero disk I/O</sub> | 0.90 ms ± 0.02 ms | **0.56 ms ± 0.02 ms** | **1.63×** |
+| **In-Memory Decompression (DEFLATE)**<br><sub>50 compressed pages, single-pass inflate</sub> | 44.18 ms ± 0.15 ms | **24.04 ms ± 0.18 ms** | **1.84×** |
+| **Random-Access Page Reads**<br><sub>80 pages directly from disk</sub> | 1.95 ms ± 0.07 ms | **1.73 ms ± 0.02 ms** | **1.11×** |
+| **Concurrent Prefetching**<br><sub>32 reads across 4 threads</sub> | 0.26 ms ± 0.00 ms | **0.25 ms ± 0.01 ms** | **1.03×** |
 
 Run locally with one command:
 
