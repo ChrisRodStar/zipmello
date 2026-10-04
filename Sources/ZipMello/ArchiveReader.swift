@@ -46,6 +46,28 @@ final class ArchiveFile: Sendable {
         }
     }
 
+    /// Reads directly into a destination raw buffer pointer without intermediate heap allocations.
+    func read(offset: UInt64, into target: UnsafeMutableRawBufferPointer) throws {
+        let count = target.count
+        guard count >= 0, offset <= bytes, UInt64(count) <= bytes - offset else {
+            throw ArchiveFailure.invalidSource("Entry extends beyond archive")
+        }
+        if count == 0 {
+            return
+        }
+
+        var completed = 0
+        while completed < count {
+            try Task.checkCancellation()
+            let part = UnsafeMutableRawBufferPointer(rebasing: target[completed...])
+            let read = try descriptor.read(fromAbsoluteOffset: Int64(offset) + Int64(completed), into: part)
+            guard read > 0 else {
+                throw ArchiveFailure.invalidSource("Truncated archive")
+            }
+            completed += read
+        }
+    }
+
     /// Performs a positional read (`pread`) without altering any shared file seek cursor.
     func read(offset: UInt64, count: Int) throws -> Data {
         guard count >= 0, offset <= bytes, UInt64(count) <= bytes - offset else {
@@ -55,29 +77,11 @@ final class ArchiveFile: Sendable {
             return Data()
         }
 
-        let storage = UnsafeMutableRawPointer.allocate(
-            byteCount: count,
-            alignment: MemoryLayout<UInt64>.alignment
-        )
-        do {
-            let target = UnsafeMutableRawBufferPointer(start: storage, count: count)
-            var completed = 0
-            while completed < count {
-                try Task.checkCancellation()
-                let part = UnsafeMutableRawBufferPointer(rebasing: target[completed...])
-                let read = try descriptor.read(fromAbsoluteOffset: Int64(offset) + Int64(completed), into: part)
-                guard read > 0 else {
-                    throw ArchiveFailure.invalidSource("Truncated archive")
-                }
-                completed += read
-            }
-        } catch {
-            storage.deallocate()
-            throw error
+        var data = Data(count: count)
+        try data.withUnsafeMutableBytes { target in
+            try read(offset: offset, into: target)
         }
-        return Data(bytesNoCopy: storage, count: count, deallocator: .custom { pointer, _ in
-            pointer.deallocate()
-        })
+        return data
     }
 }
 
@@ -98,6 +102,23 @@ enum ArchiveInput: Sendable {
     func validateIdentity() throws {
         if case .file(let file) = self {
             try file.validateIdentity(at: file.url)
+        }
+    }
+
+    func read(offset: UInt64, into target: UnsafeMutableRawBufferPointer) throws {
+        switch self {
+        case .file(let file):
+            try file.read(offset: offset, into: target)
+        case .bytes(let data):
+            let count = target.count
+            guard count >= 0,
+                  offset <= UInt64(data.count),
+                  UInt64(count) <= UInt64(data.count) - offset else {
+                throw ArchiveFailure.invalidSource("Entry extends beyond archive")
+            }
+            if count == 0 { return }
+            let start = data.startIndex + Int(offset)
+            data.copyBytes(to: target, from: start..<(start + count))
         }
     }
 
@@ -134,6 +155,63 @@ struct ArchiveReadWorker: Sendable {
     }
 
     func read(_ entry: ArchiveReadDescriptor, path: String) throws -> Data {
+        try Task.checkCancellation()
+        guard entry.expandedBytes <= limits.maximumEntryBytes else {
+            throw ArchiveFailure.memberTooLarge(path)
+        }
+
+        if entry.compression == .stored {
+            guard entry.compressedBytes == entry.expandedBytes else {
+                throw ArchiveFailure.sizeMismatch(path)
+            }
+            let count = Int(entry.expandedBytes)
+            if count == 0 {
+                guard entry.checksum == 0 else {
+                    throw ArchiveFailure.checksumMismatch(path)
+                }
+                return Data()
+            }
+
+            // Direct single-pread fast path:
+            // 1. Allocate final Data once
+            // 2. pread directly into its mutable storage
+            // 3. CRC once across final buffer
+            // 4. Return Data
+            var output = Data(count: count)
+            let calculatedCRC = try output.withUnsafeMutableBytes { (rawBuffer: UnsafeMutableRawBufferPointer) -> UInt32 in
+                try input.read(offset: entry.offset, into: rawBuffer)
+                return ZipChecksum.update(current: 0, buffer: UnsafeRawBufferPointer(rawBuffer))
+            }
+
+            guard calculatedCRC == entry.checksum else {
+                throw ArchiveFailure.checksumMismatch(path)
+            }
+            return output
+        }
+
+        if entry.compression == .deflate,
+           tuning.wholeBufferDeflateLimit > 0,
+           entry.expandedBytes <= UInt64(tuning.wholeBufferDeflateLimit) {
+            let count = Int(entry.expandedBytes)
+            if count == 0 {
+                guard entry.checksum == 0 else {
+                    throw ArchiveFailure.checksumMismatch(path)
+                }
+                return Data()
+            }
+
+            let compressed = try input.read(offset: entry.offset, count: Int(entry.compressedBytes))
+            var output = Data(count: count)
+            let calculatedCRC = try ZipDeflateEngine.decompressWholeBuffer(
+                compressed: compressed,
+                destination: &output
+            )
+            guard calculatedCRC == entry.checksum else {
+                throw ArchiveFailure.checksumMismatch(path)
+            }
+            return output
+        }
+
         var output = Data()
         output.reserveCapacity(Int(entry.expandedBytes))
         try consume(entry, path: path) { chunk in

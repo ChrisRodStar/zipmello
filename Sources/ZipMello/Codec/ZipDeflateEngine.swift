@@ -114,6 +114,39 @@ enum ZipDeflateEngine {
         return crc
     }
 
+    /// Decompresses an entire raw DEFLATE buffer in a single pass into a pre-allocated destination buffer.
+    static func decompressWholeBuffer(
+        compressed: Data,
+        destination: inout Data
+    ) throws -> UInt32 {
+        var strm = z_stream()
+        let initResult = inflateInit2_(&strm, -15, ZLIB_VERSION, Int32(MemoryLayout<z_stream>.size))
+        guard initResult == Z_OK else {
+            throw ArchiveFailure.invalidSource("inflateInit2 failed with status \(initResult)")
+        }
+        defer {
+            inflateEnd(&strm)
+        }
+
+        return try destination.withUnsafeMutableBytes { dstBuf in
+            try compressed.withUnsafeBytes { srcBuf in
+                guard let srcBase = srcBuf.baseAddress, let dstBase = dstBuf.baseAddress else {
+                    return 0
+                }
+                strm.next_in = UnsafeMutablePointer(mutating: srcBase.assumingMemoryBound(to: Bytef.self))
+                strm.avail_in = uInt(srcBuf.count)
+                strm.next_out = dstBase.assumingMemoryBound(to: Bytef.self)
+                strm.avail_out = uInt(dstBuf.count)
+
+                let res = inflate(&strm, Z_FINISH)
+                guard res == Z_STREAM_END else {
+                    throw ArchiveFailure.invalidSource("zlib inflate error \(res)")
+                }
+                return ZipChecksum.update(current: 0, buffer: UnsafeRawBufferPointer(dstBuf))
+            }
+        }
+    }
+
     /// Compresses uncompressed data into a raw DEFLATE stream using sliding buffer windows.
     ///
     /// - Parameters:

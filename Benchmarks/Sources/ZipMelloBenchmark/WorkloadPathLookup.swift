@@ -10,6 +10,7 @@ import ZIPFoundation
 /// - This benchmark measures only entry resolution (no payload decompression).
 public final class WorkloadPathLookup: HeadToHeadWorkload, @unchecked Sendable {
     public let name = "Path Lookup by Name (80 lookups, stock vs indexed)"
+    public var independentCalibration: Bool { true }
     private let archiveURL: URL
     private let seed: UInt64
     private var randomOrder: [String] = []
@@ -27,7 +28,19 @@ public final class WorkloadPathLookup: HeadToHeadWorkload, @unchecked Sendable {
         let listing = try await zmReader.listing()
         self.zipMelloReader = zmReader
 
-        let paths = listing.map(\.path).sorted(by: deterministicNaturalSort)
+        let paths = listing
+            .map(\.path)
+            .filter { $0.lowercased().hasSuffix(".jpg") }
+            .sorted(by: deterministicNaturalSort)
+
+        guard paths.count == 80 else {
+            throw NSError(
+                domain: "WorkloadPathLookup",
+                code: 1,
+                userInfo: [NSLocalizedDescriptionKey: "Expected exactly 80 jpg pages, found \(paths.count)"]
+            )
+        }
+
         var prng = DeterministicPRNG(seed: seed)
         self.randomOrder = prng.shuffled(paths)
 

@@ -115,6 +115,12 @@ public actor ArchivePageStore {
     private var extractionCount: UInt64 = 0
     private var hitCount: UInt64 = 0
     private var evictionCount: UInt64 = 0
+    private var inFlightExtractions: Int = 0
+    private var permitWaiters: [UUID: CheckedContinuation<Void, Error>] = [:]
+    private var permitQueue: [UUID] = []
+    private var queuedRequestCount: UInt64 = 0
+    private var peakQueueDepthCount: Int = 0
+    private var cancelledBeforeExtractionCount: UInt64 = 0
 
     /// Initializes a page store with byte and file bounds in a designated working directory.
     public init(
@@ -154,6 +160,50 @@ public actor ArchivePageStore {
         return try await lease(path, from: url, identity: ArchiveFileIdentity(url), lookup: lookup)
     }
 
+    fileprivate func acquireExtractionPermit() async throws {
+        try Task.checkCancellation()
+        if inFlightExtractions < maximumExtractions {
+            inFlightExtractions += 1
+            return
+        }
+
+        queuedRequestCount += 1
+        let ticket = UUID()
+        permitQueue.append(ticket)
+        peakQueueDepthCount = max(peakQueueDepthCount, permitQueue.count)
+
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                permitWaiters[ticket] = continuation
+            }
+        } onCancel: {
+            Task { [self] in
+                await self.cancelPermitWait(ticket: ticket)
+            }
+        }
+    }
+
+    fileprivate func cancelPermitWait(ticket: UUID) {
+        if let idx = permitQueue.firstIndex(of: ticket) {
+            permitQueue.remove(at: idx)
+            cancelledBeforeExtractionCount += 1
+        }
+        if let continuation = permitWaiters.removeValue(forKey: ticket) {
+            continuation.resume(throwing: CancellationError())
+        }
+    }
+
+    fileprivate func releaseExtractionPermit() {
+        while !permitQueue.isEmpty {
+            let nextTicket = permitQueue.removeFirst()
+            if let continuation = permitWaiters.removeValue(forKey: nextTicket) {
+                continuation.resume()
+                return
+            }
+        }
+        inFlightExtractions = max(0, inFlightExtractions - 1)
+    }
+
     fileprivate func lease(
         _ path: String,
         from url: URL,
@@ -180,32 +230,41 @@ public actor ArchivePageStore {
         if let existing = pending[key] {
             item = existing
         } else {
-            guard pending.count < maximumExtractions else {
-                throw ArchiveFailure.cacheCapacityExceeded
-            }
             let id = UUID()
             let currentEpoch = epoch
             let pool = pool
             let directory = directory
 
             let task = Task { [self] in
-                let member = try await pool.member(path, from: url, lookup: lookup)
-                guard !member.isDirectory else {
-                    throw ArchiveFailure.unsupportedEntry(path)
-                }
-                try Task.checkCancellation()
-                try reserve(member.uncompressedBytes, id: id, epoch: currentEpoch)
-                let ext = URL(fileURLWithPath: member.path).pathExtension
-                let output = directory.appendingPathComponent(id.uuidString).appendingPathExtension(ext)
+                try await self.acquireExtractionPermit()
+                var permitHeld = true
                 do {
-                    try await pool.extract(member.path, from: url, to: output, durability: .buffered)
                     try Task.checkCancellation()
-                    guard try ArchiveFileIdentity(url) == key.identity else {
-                        throw ArchiveFailure.invalidSource("Archive changed during extraction")
+                    let member = try await pool.member(path, from: url, lookup: lookup)
+                    guard !member.isDirectory else {
+                        throw ArchiveFailure.unsupportedEntry(path)
                     }
-                    return Prepared(url: output, bytes: member.uncompressedBytes)
+                    try Task.checkCancellation()
+                    try self.reserve(member.uncompressedBytes, id: id, epoch: currentEpoch)
+                    let ext = URL(fileURLWithPath: member.path).pathExtension
+                    let output = directory.appendingPathComponent(id.uuidString).appendingPathExtension(ext)
+                    do {
+                        try await pool.extract(member.path, from: url, to: output, durability: .buffered)
+                        try Task.checkCancellation()
+                        guard try ArchiveFileIdentity(url) == key.identity else {
+                            throw ArchiveFailure.invalidSource("Archive changed during extraction")
+                        }
+                        self.releaseExtractionPermit()
+                        permitHeld = false
+                        return Prepared(url: output, bytes: member.uncompressedBytes)
+                    } catch {
+                        try? FileManager.default.removeItem(at: output)
+                        throw error
+                    }
                 } catch {
-                    try? FileManager.default.removeItem(at: output)
+                    if permitHeld {
+                        self.releaseExtractionPermit()
+                    }
                     throw error
                 }
             }
@@ -259,7 +318,7 @@ public actor ArchivePageStore {
         entries.values.reduce(UInt64(0)) { $0 + $1.bytes } + reservations.values.reduce(UInt64(0), +)
     }
 
-    private func reserve(_ bytes: UInt64, id: UUID, epoch: UInt64) throws {
+    fileprivate func reserve(_ bytes: UInt64, id: UUID, epoch: UInt64) throws {
         guard epoch == self.epoch else {
             throw CancellationError()
         }
@@ -316,6 +375,14 @@ public actor ArchivePageStore {
             item.task.cancel()
         }
         pending.removeAll()
+
+        for continuation in permitWaiters.values {
+            continuation.resume(throwing: CancellationError())
+        }
+        permitWaiters.removeAll()
+        permitQueue.removeAll()
+        inFlightExtractions = 0
+
         for id in Array(entries.keys) {
             entries[id]?.retired = true
             if entries[id]?.leases == 0 {
@@ -333,6 +400,9 @@ public actor ArchivePageStore {
         public let extractions: UInt64
         public let hits: UInt64
         public let evictions: UInt64
+        public let queuedRequests: UInt64
+        public let peakQueueDepth: Int
+        public let cancelledBeforeExtraction: UInt64
 
         public init(
             files: Int,
@@ -340,7 +410,10 @@ public actor ArchivePageStore {
             activeLeases: Int,
             extractions: UInt64,
             hits: UInt64 = 0,
-            evictions: UInt64 = 0
+            evictions: UInt64 = 0,
+            queuedRequests: UInt64 = 0,
+            peakQueueDepth: Int = 0,
+            cancelledBeforeExtraction: UInt64 = 0
         ) {
             self.files = files
             self.bytes = bytes
@@ -348,6 +421,9 @@ public actor ArchivePageStore {
             self.extractions = extractions
             self.hits = hits
             self.evictions = evictions
+            self.queuedRequests = queuedRequests
+            self.peakQueueDepth = peakQueueDepth
+            self.cancelledBeforeExtraction = cancelledBeforeExtraction
         }
     }
 
@@ -359,7 +435,10 @@ public actor ArchivePageStore {
             activeLeases: leases.count,
             extractions: extractionCount,
             hits: hitCount,
-            evictions: evictionCount
+            evictions: evictionCount,
+            queuedRequests: queuedRequestCount,
+            peakQueueDepth: peakQueueDepthCount,
+            cancelledBeforeExtraction: cancelledBeforeExtractionCount
         )
     }
 }

@@ -216,7 +216,7 @@ public struct ArchiveTuning: Sendable {
 
     /// Four parallel read lanes optimized for prefetching pages or assets across multiple tasks.
     public static var pagePrefetch: Self {
-        .init(readConcurrency: 4)
+        .init(readConcurrency: 4, wholeBufferDeflateLimit: 4 * 1_024 * 1_024)
     }
 
     /// Single-pass decompression for entries fitting within 4 MB.

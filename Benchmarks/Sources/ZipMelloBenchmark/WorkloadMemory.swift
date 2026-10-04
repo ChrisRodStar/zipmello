@@ -3,15 +3,16 @@ import ZipMello
 import ZIPFoundation
 import CryptoKit
 
-/// Benchmark: In-Memory Decompression (50 pages).
+/// Benchmark: In-Memory Page Extraction (50 pages).
 ///
 /// Timed region:
-/// - Measures pure decompression performance of in-memory ZIP payloads into materialized `Data`.
+/// - Measures extraction/decompression performance of in-memory ZIP payloads into materialized `Data`.
 /// - Archive parsing and reader initialization (`ArchiveMemoryReader(data:)` and `Archive(data:)`)
-///   occur OUTSIDE the timer so index construction overhead is not conflated with decompression throughput.
-/// - Both engines materialize full `Data` with 64 KB decompression buffers and verify CRC.
+///   occur OUTSIDE the timer so index construction overhead is not conflated with payload throughput.
+/// - Both engines materialize full `Data` with 64 KB buffers and verify CRC.
+/// - SHA-256 verification occurs strictly outside the timer in `validate()`.
 public final class WorkloadMemory: HeadToHeadWorkload, @unchecked Sendable {
-    public let name = "In-Memory Decompression (50 pages, pre-parsed)"
+    public let name: String
     private let archiveURL: URL
     private var archiveData: Data = Data()
     private var targetPaths: [String] = []
@@ -21,14 +22,12 @@ public final class WorkloadMemory: HeadToHeadWorkload, @unchecked Sendable {
     private var zfArchive: Archive?
     private var zfEntries: [String: Entry] = [:]
 
-    // Verification sinks
-    private var lastZMSHA256: String = ""
-    private var lastZFSHA256: String = ""
     private var lastZMBytes: Int = 0
     private var lastZFBytes: Int = 0
 
-    public init(archiveURL: URL) {
+    public init(archiveURL: URL, name: String = "In-Memory Page Extraction (50 pages, stored)") {
         self.archiveURL = archiveURL
+        self.name = name
     }
 
     public func prepare() async throws {
@@ -63,20 +62,17 @@ public final class WorkloadMemory: HeadToHeadWorkload, @unchecked Sendable {
         let clock = ContinuousClock()
         let start = clock.now
         var totalBytes = 0
-        var hasher = SHA256()
 
         for path in targetPaths {
             let data = try reader.read(path)
             totalBytes &+= data.count
-            hasher.update(data: data)
-            // 'data' goes out of scope and is reclaimed
+            // 'data' goes out of scope and is immediately reclaimed
         }
 
         let elapsed = clock.now - start
         let durationSec = Double(elapsed.components.seconds) + Double(elapsed.components.attoseconds) / 1e18
 
         self.lastZMBytes = totalBytes
-        self.lastZMSHA256 = hasher.finalize().map { String(format: "%02x", $0) }.joined()
         return WorkloadRunResult(durationSeconds: durationSec, sinkMetric: totalBytes)
     }
 
@@ -88,7 +84,6 @@ public final class WorkloadMemory: HeadToHeadWorkload, @unchecked Sendable {
         let clock = ContinuousClock()
         let start = clock.now
         var totalBytes = 0
-        var hasher = SHA256()
 
         for path in targetPaths {
             guard let entry = zfEntries[path] else {
@@ -105,15 +100,13 @@ public final class WorkloadMemory: HeadToHeadWorkload, @unchecked Sendable {
             }
 
             totalBytes &+= data.count
-            hasher.update(data: data)
-            // 'data' goes out of scope and is reclaimed
+            // 'data' goes out of scope and is immediately reclaimed
         }
 
         let elapsed = clock.now - start
         let durationSec = Double(elapsed.components.seconds) + Double(elapsed.components.attoseconds) / 1e18
 
         self.lastZFBytes = totalBytes
-        self.lastZFSHA256 = hasher.finalize().map { String(format: "%02x", $0) }.joined()
         return WorkloadRunResult(durationSeconds: durationSec, sinkMetric: totalBytes)
     }
 
@@ -126,7 +119,27 @@ public final class WorkloadMemory: HeadToHeadWorkload, @unchecked Sendable {
                 userInfo: [NSLocalizedDescriptionKey: "Byte mismatch: ZipMello=\(lastZMBytes), ZIPFoundation=\(lastZFBytes)"]
             )
         }
-        guard lastZMSHA256 == lastZFSHA256 else {
+
+        // Untimed separate verification pass
+        guard let reader = zipMelloReader, let archive = zfArchive else { return }
+        var zmHasher = SHA256()
+        var zfHasher = SHA256()
+
+        for path in targetPaths {
+            let zmData = try reader.read(path)
+            zmHasher.update(data: zmData)
+
+            guard let entry = zfEntries[path] else { continue }
+            var zfData = Data()
+            zfData.reserveCapacity(Int(entry.uncompressedSize))
+            _ = try archive.extract(entry, bufferSize: 65536) { zfData.append($0) }
+            zfHasher.update(data: zfData)
+        }
+
+        let zmDigest = zmHasher.finalize().map { String(format: "%02x", $0) }.joined()
+        let zfDigest = zfHasher.finalize().map { String(format: "%02x", $0) }.joined()
+
+        guard zmDigest == zfDigest else {
             throw NSError(
                 domain: "WorkloadMemory",
                 code: 6,

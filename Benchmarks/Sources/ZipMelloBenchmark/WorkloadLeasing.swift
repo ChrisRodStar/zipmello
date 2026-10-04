@@ -7,6 +7,9 @@ public struct LeasingResult: Sendable, Codable {
     public let cacheHits: UInt64
     public let cacheMisses: UInt64
     public let evictions: UInt64
+    public let queuedRequests: UInt64
+    public let peakQueueDepth: Int
+    public let cancelledBeforeExtraction: UInt64
     public let peakCachedBytes: UInt64
     public let peakDiskFootprintBytes: UInt64
     public let hitLatency: MeasurementStats
@@ -142,11 +145,12 @@ public final class WorkloadLeasing: @unchecked Sendable {
 
             if let contents = try? fm.subpathsOfDirectory(atPath: staging.path) {
                 var currentPhysicalBytes: UInt64 = 0
+                let keys: Set<URLResourceKey> = [.totalFileAllocatedSizeKey, .fileAllocatedSizeKey]
                 for sub in contents {
                     let fullPath = staging.appendingPathComponent(sub)
-                    if let attrs = try? fm.attributesOfItem(atPath: fullPath.path),
-                       let size = attrs[.size] as? UInt64 {
-                        currentPhysicalBytes += size
+                    if let values = try? fullPath.resourceValues(forKeys: keys) {
+                        let allocated = values.totalFileAllocatedSize ?? values.fileAllocatedSize ?? 0
+                        currentPhysicalBytes += UInt64(allocated)
                     }
                 }
                 peakDiskBytes = max(peakDiskBytes, currentPhysicalBytes)
@@ -172,6 +176,9 @@ public final class WorkloadLeasing: @unchecked Sendable {
             cacheHits: finalStats.hits,
             cacheMisses: finalStats.extractions,
             evictions: finalStats.evictions,
+            queuedRequests: finalStats.queuedRequests,
+            peakQueueDepth: finalStats.peakQueueDepth,
+            cancelledBeforeExtraction: finalStats.cancelledBeforeExtraction,
             peakCachedBytes: peakCachedBytes,
             peakDiskFootprintBytes: peakDiskBytes,
             hitLatency: MeasurementStats(samples: hitLatencies),

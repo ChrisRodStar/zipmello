@@ -20,8 +20,6 @@ public final class WorkloadDiscovery: HeadToHeadWorkload, @unchecked Sendable {
     // Verification sinks
     private var lastZMCoverSize: Int = 0
     private var lastZFCoverSize: Int = 0
-    private var lastZMCoverDigest: String = ""
-    private var lastZFCoverDigest: String = ""
 
     public init(archiveURL: URL) {
         self.archiveURL = archiveURL
@@ -58,7 +56,6 @@ public final class WorkloadDiscovery: HeadToHeadWorkload, @unchecked Sendable {
         let durationSec = Double(elapsed.components.seconds) + Double(elapsed.components.attoseconds) / 1e18
 
         self.lastZMCoverSize = discovery.coverSize
-        self.lastZMCoverDigest = discovery.coverDigest
         let metric = discovery.coverSize &+ (discovery.hasComicInfo ? 1 : 0) &+ paths.count
         return WorkloadRunResult(durationSeconds: durationSec, sinkMetric: metric)
     }
@@ -95,7 +92,6 @@ public final class WorkloadDiscovery: HeadToHeadWorkload, @unchecked Sendable {
         let durationSec = Double(elapsed.components.seconds) + Double(elapsed.components.attoseconds) / 1e18
 
         self.lastZFCoverSize = discovery.coverSize
-        self.lastZFCoverDigest = discovery.coverDigest
         let metric = discovery.coverSize &+ (discovery.hasComicInfo ? 1 : 0) &+ paths.count
         return WorkloadRunResult(durationSeconds: durationSec, sinkMetric: metric)
     }
@@ -109,10 +105,41 @@ public final class WorkloadDiscovery: HeadToHeadWorkload, @unchecked Sendable {
                 userInfo: [NSLocalizedDescriptionKey: "Cover size mismatch: ZipMello=\(lastZMCoverSize), ZIPFoundation=\(lastZFCoverSize)"]
             )
         }
-        guard lastZMCoverDigest == lastZFCoverDigest else {
+
+        // Untimed separate verification pass for cover digest
+        let reader = try await ArchiveReader.open(archiveURL)
+        let listing = try await reader.listing()
+        let paths = listing.map(\.path)
+        let imagePaths = paths
+            .filter { path in
+                let lower = path.lowercased()
+                return lower.hasSuffix(".jpg") || lower.hasSuffix(".jpeg") || lower.hasSuffix(".png") || lower.hasSuffix(".webp")
+            }
+            .sorted(by: deterministicNaturalSort)
+
+        guard let firstImage = imagePaths.first else {
+            await reader.close()
+            return
+        }
+
+        let zmCoverData = try await reader.read(firstImage)
+        await reader.close()
+
+        let archive = try Archive(url: archiveURL, accessMode: .read)
+        guard let zfEntry = archive[firstImage] else {
+            throw NSError(domain: "WorkloadDiscovery", code: 5, userInfo: [NSLocalizedDescriptionKey: "Missing entry in ZF: \(firstImage)"])
+        }
+        var zfCoverData = Data()
+        zfCoverData.reserveCapacity(Int(zfEntry.uncompressedSize))
+        _ = try archive.extract(zfEntry, bufferSize: 65536) { zfCoverData.append($0) }
+
+        let zmDigest = SHA256.hash(data: zmCoverData).map { String(format: "%02x", $0) }.joined()
+        let zfDigest = SHA256.hash(data: zfCoverData).map { String(format: "%02x", $0) }.joined()
+
+        guard zmDigest == zfDigest else {
             throw NSError(
                 domain: "WorkloadDiscovery",
-                code: 5,
+                code: 6,
                 userInfo: [NSLocalizedDescriptionKey: "Cover SHA-256 mismatch between ZipMello and ZIPFoundation"]
             )
         }
@@ -122,7 +149,7 @@ public final class WorkloadDiscovery: HeadToHeadWorkload, @unchecked Sendable {
     private func executeComicDiscovery(
         paths: [String],
         read: (String) async throws -> Data
-    ) async throws -> (coverSize: Int, coverDigest: String, hasComicInfo: Bool) {
+    ) async throws -> (coverSize: Int, hasComicInfo: Bool) {
         let imagePaths = paths
             .filter { path in
                 let lower = path.lowercased()
@@ -131,11 +158,9 @@ public final class WorkloadDiscovery: HeadToHeadWorkload, @unchecked Sendable {
             .sorted(by: deterministicNaturalSort)
 
         var coverSize = 0
-        var coverDigest = ""
         if let firstImage = imagePaths.first {
             let coverData = try await read(firstImage)
             coverSize = coverData.count
-            coverDigest = SHA256.hash(data: coverData).map { String(format: "%02x", $0) }.joined()
         }
 
         var hasComicInfo = false
@@ -146,6 +171,6 @@ public final class WorkloadDiscovery: HeadToHeadWorkload, @unchecked Sendable {
             }
         }
 
-        return (coverSize, coverDigest, hasComicInfo)
+        return (coverSize, hasComicInfo)
     }
 }

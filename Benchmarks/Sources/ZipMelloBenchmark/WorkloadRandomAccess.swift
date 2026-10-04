@@ -9,10 +9,11 @@ import CryptoKit
 /// - Pure random page extraction into materialized `Data` across 80 pages.
 /// - Archive opening and central-directory indexing occur OUTSIDE the timed region.
 /// - ZIPFoundation entries are pre-indexed into `[String: Entry]` outside the timer to eliminate its
-///   stock linear-scan lookup overhead and compare pure random decompression engines fairly.
-/// - Both engines materialize full `Data` with 64 KB decompression buffers and verify CRC32.
+///   stock linear-scan lookup overhead and compare pure extraction engines fairly.
+/// - Both engines materialize full `Data` with 64 KB buffers and verify CRC32.
+/// - SHA-256 verification happens strictly outside the timer in `validate()`.
 public final class WorkloadRandomAccess: HeadToHeadWorkload, @unchecked Sendable {
-    public let name = "Random-Access Page Reads (80 pages, pre-indexed)"
+    public let name: String
     private let archiveURL: URL
     private let seed: UInt64
     private var randomOrder: [String] = []
@@ -22,15 +23,13 @@ public final class WorkloadRandomAccess: HeadToHeadWorkload, @unchecked Sendable
     private var zfArchive: Archive?
     private var zfEntries: [String: Entry] = [:]
 
-    // Verification sinks for outside-the-timer SHA-256 checks
-    private var lastZMSHA256: String = ""
-    private var lastZFSHA256: String = ""
     private var lastZMBytes: Int = 0
     private var lastZFBytes: Int = 0
 
-    public init(archiveURL: URL, seed: UInt64 = 0x123456789ABCDEF) {
+    public init(archiveURL: URL, seed: UInt64 = 0x123456789ABCDEF, name: String = "Random-Access Page Reads (80 pages, pre-indexed)") {
         self.archiveURL = archiveURL
         self.seed = seed
+        self.name = name
     }
 
     public func prepare() async throws {
@@ -73,21 +72,18 @@ public final class WorkloadRandomAccess: HeadToHeadWorkload, @unchecked Sendable
         let clock = ContinuousClock()
         let start = clock.now
         var totalBytes = 0
-        var hasher = SHA256()
 
         for path in randomOrder {
             // Materialize full Data (ZipMello validates CRC32 internally)
             let data = try await reader.read(path)
             totalBytes &+= data.count
-            hasher.update(data: data)
-            // 'data' goes out of scope here and is reclaimed
+            // 'data' goes out of scope here and is immediately reclaimed
         }
 
         let elapsed = clock.now - start
         let durationSec = Double(elapsed.components.seconds) + Double(elapsed.components.attoseconds) / 1e18
 
         self.lastZMBytes = totalBytes
-        self.lastZMSHA256 = hasher.finalize().map { String(format: "%02x", $0) }.joined()
         return WorkloadRunResult(durationSeconds: durationSec, sinkMetric: totalBytes)
     }
 
@@ -99,7 +95,6 @@ public final class WorkloadRandomAccess: HeadToHeadWorkload, @unchecked Sendable
         let clock = ContinuousClock()
         let start = clock.now
         var totalBytes = 0
-        var hasher = SHA256()
 
         for path in randomOrder {
             guard let entry = zfEntries[path] else {
@@ -117,15 +112,13 @@ public final class WorkloadRandomAccess: HeadToHeadWorkload, @unchecked Sendable
             }
 
             totalBytes &+= data.count
-            hasher.update(data: data)
-            // 'data' goes out of scope here and is reclaimed
+            // 'data' goes out of scope here and is immediately reclaimed
         }
 
         let elapsed = clock.now - start
         let durationSec = Double(elapsed.components.seconds) + Double(elapsed.components.attoseconds) / 1e18
 
         self.lastZFBytes = totalBytes
-        self.lastZFSHA256 = hasher.finalize().map { String(format: "%02x", $0) }.joined()
         return WorkloadRunResult(durationSeconds: durationSec, sinkMetric: totalBytes)
     }
 
@@ -138,7 +131,27 @@ public final class WorkloadRandomAccess: HeadToHeadWorkload, @unchecked Sendable
                 userInfo: [NSLocalizedDescriptionKey: "Byte count mismatch: ZipMello=\(lastZMBytes), ZIPFoundation=\(lastZFBytes)"]
             )
         }
-        guard lastZMSHA256 == lastZFSHA256 else {
+
+        // Perform independent SHA-256 verification pass completely outside the timer
+        guard let reader = zipMelloReader, let archive = zfArchive else { return }
+        var zmHasher = SHA256()
+        var zfHasher = SHA256()
+
+        for path in randomOrder {
+            let zmData = try await reader.read(path)
+            zmHasher.update(data: zmData)
+
+            guard let entry = zfEntries[path] else { continue }
+            var zfData = Data()
+            zfData.reserveCapacity(Int(entry.uncompressedSize))
+            _ = try archive.extract(entry, bufferSize: 65536) { zfData.append($0) }
+            zfHasher.update(data: zfData)
+        }
+
+        let zmDigest = zmHasher.finalize().map { String(format: "%02x", $0) }.joined()
+        let zfDigest = zfHasher.finalize().map { String(format: "%02x", $0) }.joined()
+
+        guard zmDigest == zfDigest else {
             throw NSError(
                 domain: "WorkloadRandomAccess",
                 code: 6,

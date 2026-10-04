@@ -20,13 +20,7 @@ public struct EnvironmentInfo: Sendable, Codable {
         let osVersion = ProcessInfo.processInfo.operatingSystemVersionString
         let machineLocale = Locale.current.identifier
 
-        #if swift(>=6.0)
-        let swiftVersion = "6.0 Strict"
-        #elseif swift(>=5.10)
-        let swiftVersion = "5.10"
-        #else
-        let swiftVersion = "5.x"
-        #endif
+        let swiftVersion = getSwiftVersion()
 
         let gitCommit = getGitCommit() ?? "local checkout"
 
@@ -81,6 +75,28 @@ public struct EnvironmentInfo: Sendable, Codable {
             return commit.isEmpty ? nil : commit
         } catch {
             return nil
+        }
+    }
+
+    private static func getSwiftVersion() -> String {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/swift")
+        process.arguments = ["--version"]
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = Pipe()
+        do {
+            try process.run()
+            process.waitUntilExit()
+            guard process.terminationStatus == 0 else { return "Swift 6.0" }
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            let out = String(decoding: data, as: UTF8.self)
+            if let line = out.components(separatedBy: .newlines).first(where: { $0.contains("Swift version") }) {
+                return line.trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+            return out.components(separatedBy: .newlines).first?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "Swift 6.0"
+        } catch {
+            return "Swift 6.0"
         }
     }
 }

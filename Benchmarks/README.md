@@ -25,22 +25,23 @@ Measured on Apple Silicon (Apple M3, 8 GB RAM, macOS 15, Release `-O` build, war
 
 | Workload | ZIPFoundation 0.9.20 | ZipMello | Median Paired Speedup | Details |
 | :--- | ---: | ---: | ---: | :--- |
-| **Path Lookup by Name** | 14.22 ms ± 0.04 ms | **0.26 ms ± 0.00 ms** | **54.86×** | 80 path queries; ZipMello average $O(1)$ index vs ZIPFoundation stock $O(N)$ linear scans |
-| **Library Discovery** | 0.66 ms ± 0.00 ms | **0.35 ms ± 0.00 ms** | **1.93×** | Open archive + index central directory + extract cover + parse `ComicInfo.xml` |
-| **In-Memory Decompression** | 5.18 ms ± 0.01 ms | **5.06 ms ± 0.00 ms** | **1.02×** | 50 page extractions from pre-parsed memory readers (`ArchiveMemoryReader` vs `Archive(data:)`) |
-| **Concurrent Prefetching** | 2.87 ms ± 0.01 ms | 2.95 ms ± 0.00 ms | 0.97× | 32 simultaneous page extractions across 4 threads (4 ZIPFoundation handles vs ZipMello `.pagePrefetch` 4 lanes) |
-| **Random-Access Page Reads** | 8.90 ms ± 0.02 ms | 9.52 ms ± 0.01 ms | 0.94× | 80 page extractions into materialized `Data` with pre-indexed entries |
+| **Path Lookup by Name** | 11.47 ms ± 0.03 ms | **0.21 ms ± 0.00 ms** | **54.06×** | 80 path queries; ZipMello average $O(1)$ index vs ZIPFoundation stock $O(N)$ linear scans |
+| **Library Discovery** | 0.62 ms ± 0.01 ms | **0.29 ms ± 0.01 ms** | **2.17×** | Open archive + index central directory + extract cover + parse `ComicInfo.xml` |
+| **In-Memory Extraction (Stored)** | 0.81 ms ± 0.01 ms | **0.63 ms ± 0.01 ms** | **1.28×** | 50 stored pages read directly into preallocated buffer without chunking |
+| **In-Memory Decompression (DEFLATE)** | 43.51 ms ± 0.11 ms | **23.14 ms ± 0.08 ms** | **1.88×** | 50 DEFLATE pages decompressed into preallocated buffer via single-pass inflate |
+| **Concurrent Prefetching** | 0.26 ms ± 0.00 ms | 0.26 ms ± 0.00 ms | 0.99× | 32 simultaneous page extractions across 4 read lanes vs 4 independent archive handles |
+| **Random-Access Page Reads** | 1.77 ms ± 0.01 ms | 1.81 ms ± 0.01 ms | 0.98× | 80 page extractions into materialized `Data` with pre-indexed entries |
 
 ---
 
 ## Continuous Scroll Viewport Leasing
 
-Evaluates ZipMello's [ArchivePageStore](file:///Users/chris/Desktop/Workspace/IdeasTo/zipmello/Sources/ZipMello/ArchivePageStore.swift) simulating an active manga reader scrolling vertically through an 80-page chapter.
+Evaluates ZipMello's [ArchivePageStore](../Sources/ZipMello/ArchivePageStore.swift) simulating an active manga reader scrolling vertically through an 80-page chapter.
 
 - **Access Pattern**: 108 viewport steps combining forward reading, small 4-page backtracks, and reverse scrolling.
 - **Viewport Window**: 6 concurrent pages retained at any point.
 - **Cache Bounds**: 6.0 MB maximum memory/disk budget, 24 maximum files.
-- **Concurrency**: `maximumExtractions: 6`.
+- **Concurrency**: `maximumExtractions: 6` backed by an asynchronous permit queue with task cancellation.
 
 | Metric | Measured Value | Description |
 | :--- | ---: | :--- |
@@ -48,18 +49,19 @@ Evaluates ZipMello's [ArchivePageStore](file:///Users/chris/Desktop/Workspace/Id
 | **Cache Hits** | 32 | Pages served directly from cache without extraction |
 | **Cache Misses** | 81 | Physical disk extractions performed |
 | **Evictions** | 57 | Files safely evicted under the 6 MB / 24-file limit |
+| **Queue Backpressure** | 0 queued (depth 0, 0 cancelled) | Permitted concurrent extractions without blocking reader thread |
 | **Peak Cached Bytes** | 6.00 MB | Logical byte budget strictly maintained |
-| **Peak Disk Footprint** | 6.00 MB | Physical filesystem allocation queried via `attributesOfItem` |
-| **Cache-Hit Latency** | **0.011 ms ± 0.001 ms MAD** | 11 microseconds to acquire an active lease |
-| **Cache-Miss Latency** | 0.39 ms ± 0.07 ms MAD | Disk extraction + decompression time |
-| **Total Traversal Time** | 273.23 ms | Complete 108-step user scroll simulation |
+| **Peak Disk Footprint** | 6.07 MB | Physical filesystem allocation queried via `URLResourceKey.fileAllocatedSizeKey` |
+| **Cache-Hit Latency** | **0.010 ms ± 0.000 ms MAD** | 10 microseconds to acquire an active lease |
+| **Cache-Miss Latency** | 0.35 ms ± 0.05 ms MAD | Disk extraction + decompression time |
+| **Total Traversal Time** | 100.81 ms | Complete 108-step user scroll simulation |
 
 ---
 
 ## Methodology & Fair Comparison
 
 1. **Balanced Paired Sampling**:
-   - 2 warmup pairs discarded to eliminate one-time allocator, JIT, and cache-priming artifacts.
+   - 2 warmup pairs discarded to eliminate one-time allocator and cache-priming artifacts.
    - 10 measured pairs alternating execution order (5 $A \to B$ rounds, 5 $B \to A$ rounds).
    - Paired speedup is computed as the median of the 10 full-precision $(T_{\text{ZF}} / T_{\text{ZM}})$ ratios.
 

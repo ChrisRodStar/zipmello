@@ -314,4 +314,49 @@ private final class ConsumerWorkspace: Sendable {
         try await writer.create(at: work.file("bad.zip"), assets: [.init(path: "index.json", content: .bytes(Data("{\"title\":\"../escape\"}".utf8)))])
         await #expect(throws: ArchiveFailure.unsafePath("../escape")) { try await DictionaryArchivePreflight.validate(work.file("bad.zip")) }
     }
+
+    @Test("Page store extraction concurrency queue handles backpressure and cancellation")
+    func pageStoreExtractionConcurrencyQueue() async throws {
+        let work = try ConsumerWorkspace()
+        let url = work.file("queue_test.cbz")
+        let writer = ArchiveWriter()
+        var assets: [ArchiveAsset] = []
+        for i in 1...8 {
+            assets.append(ArchiveAsset(path: "page_\(i)", content: .bytes(Data(repeating: UInt8(i), count: 1024))))
+        }
+        try await writer.create(at: url, assets: assets)
+
+        // Store with strict concurrency limit of 2 simultaneous extractions
+        let store = try ArchivePageStore(
+            directory: work.root,
+            maximumBytes: 1_000_000,
+            maximumFiles: 20,
+            maximumExtractions: 2
+        )
+        let session = try await store.session(for: url)
+
+        // 1. Concurrently request all 8 pages (should queue rather than throwing cacheCapacityExceeded)
+        let leases = try await withThrowingTaskGroup(of: ArchiveFileLease.self) { group in
+            for i in 1...8 {
+                group.addTask {
+                    try await session.lease("page_\(i)")
+                }
+            }
+            var collected: [ArchiveFileLease] = []
+            for try await lease in group {
+                collected.append(lease)
+            }
+            return collected
+        }
+
+        #expect(leases.count == 8)
+        let stats = await store.statistics()
+        #expect(stats.extractions == 8)
+        #expect(stats.queuedRequests > 0)
+        #expect(stats.peakQueueDepth > 0)
+
+        for lease in leases {
+            await lease.release()
+        }
+    }
 }

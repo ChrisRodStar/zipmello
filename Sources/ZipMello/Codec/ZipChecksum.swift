@@ -17,8 +17,16 @@ enum ZipChecksum {
         guard let baseAddress = buffer.baseAddress, buffer.count > 0 else {
             return current
         }
-        let pointer = baseAddress.assumingMemoryBound(to: Bytef.self)
-        return UInt32(zlib.crc32(uLong(current), pointer, uInt(buffer.count)))
+        var crc = current
+        var offset = 0
+        let total = buffer.count
+        while offset < total {
+            let chunk = min(total - offset, Int(uInt.max))
+            let pointer = (baseAddress + offset).assumingMemoryBound(to: Bytef.self)
+            crc = UInt32(zlib.crc32(uLong(crc), pointer, uInt(chunk)))
+            offset += chunk
+        }
+        return crc
     }
 
     /// Computes or updates a running 32-bit CRC-32 checksum over a `Data` buffer.

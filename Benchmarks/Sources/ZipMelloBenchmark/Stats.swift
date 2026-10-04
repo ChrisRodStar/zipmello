@@ -36,7 +36,13 @@ public struct MeasurementStats: Sendable, Codable {
     }
 
     public var formattedDuration: String {
-        String(format: "%.2f ms ± %.2f ms MAD", median * 1000.0, mad * 1000.0)
+        let ms = median * 1000.0
+        let madMs = mad * 1000.0
+        if ms < 1.0 {
+            return String(format: "%.3f ms ± %.3f ms MAD", ms, madMs)
+        } else {
+            return String(format: "%.2f ms ± %.2f ms MAD", ms, madMs)
+        }
     }
 }
 

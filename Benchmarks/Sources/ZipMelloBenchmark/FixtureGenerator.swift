@@ -2,7 +2,11 @@ import Foundation
 import ZipMello
 
 public enum FixtureGenerator {
-    public static func ensureFixture(at targetURL: URL, comicSourceDir: URL) async throws -> URL {
+    public static func ensureFixture(
+        at targetURL: URL,
+        comicSourceDir: URL,
+        compression: ArchiveCompression = .stored
+    ) async throws -> URL {
         let fm = FileManager.default
         if fm.fileExists(atPath: targetURL.path) {
             return targetURL
@@ -25,20 +29,20 @@ public enum FixtureGenerator {
 
         // Cover page (page_000.jpg)
         let coverData = try Data(contentsOf: files[0])
-        assets.append(ArchiveAsset(path: "page_000.jpg", content: .bytes(coverData), compression: .stored))
+        assets.append(ArchiveAsset(path: "page_000.jpg", content: .bytes(coverData), compression: compression))
 
         // Expand to 80 pages by cycling through the real pages
         for i in 1...79 {
             let sourceFile = files[i % files.count]
             let pageData = try Data(contentsOf: sourceFile)
             let pagePath = String(format: "page_%03d.jpg", i)
-            assets.append(ArchiveAsset(path: pagePath, content: .bytes(pageData), compression: .stored))
+            assets.append(ArchiveAsset(path: pagePath, content: .bytes(pageData), compression: compression))
 
             // Add sidecar description files for every 5th page to simulate real reader sidecars
             if i % 5 == 0 {
                 let descData = Data("Scene description for page \(i) of Pepper & Carrot Episode 1.\n".utf8)
                 let descPath = String(format: "page_%03d.desc.txt", i)
-                assets.append(ArchiveAsset(path: descPath, content: .bytes(descData), compression: .stored))
+                assets.append(ArchiveAsset(path: descPath, content: .bytes(descData), compression: compression))
             }
         }
 
@@ -59,7 +63,7 @@ public enum FixtureGenerator {
           <PageCount>80</PageCount>
         </ComicInfo>
         """
-        assets.append(ArchiveAsset(path: "ComicInfo.xml", content: .bytes(Data(comicInfoXML.utf8)), compression: .stored))
+        assets.append(ArchiveAsset(path: "ComicInfo.xml", content: .bytes(Data(comicInfoXML.utf8)), compression: compression))
 
         // Create the CBZ deterministically
         let writer = ArchiveWriter()

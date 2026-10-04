@@ -18,7 +18,7 @@ private actor ZFArchiveWorker {
         self.entries = map
     }
 
-    func readEntry(_ path: String) throws -> (bytes: Int, data: Data) {
+    func readEntry(_ path: String) throws -> Int {
         guard let entry = entries[path] else {
             throw NSError(domain: "WorkloadConcurrent", code: 1, userInfo: [NSLocalizedDescriptionKey: "Entry not found: \(path)"])
         }
@@ -30,11 +30,21 @@ private actor ZFArchiveWorker {
         guard checksum == entry.checksum else {
             throw NSError(domain: "WorkloadConcurrent", code: 2, userInfo: [NSLocalizedDescriptionKey: "CRC mismatch for \(path)"])
         }
-        return (data.count, data)
+        return data.count
+    }
+
+    func extractData(_ path: String) throws -> Data {
+        guard let entry = entries[path] else {
+            throw NSError(domain: "WorkloadConcurrent", code: 1, userInfo: [NSLocalizedDescriptionKey: "Entry not found: \(path)"])
+        }
+        var data = Data()
+        data.reserveCapacity(Int(entry.uncompressedSize))
+        _ = try archive.extract(entry, bufferSize: 65536) { data.append($0) }
+        return data
     }
 }
 
-/// Benchmark: Concurrent Prefetching (32 reads).
+/// Benchmark: Concurrent Prefetching (32 reads, 4 lanes vs 4 handles).
 ///
 /// Timed region:
 /// - Measures contention and concurrent throughput when 32 requests are issued simultaneously.
@@ -43,6 +53,7 @@ private actor ZFArchiveWorker {
 /// - ZipMello is explicitly configured with `ArchiveTuning.pagePrefetch` (4 read lanes).
 /// - ZIPFoundation is given a competitive multi-handle baseline using a pool of 4 independent Archive instances.
 /// - Both engines materialize full `Data` with 64 KB decompression buffers and verify CRC.
+/// - SHA-256 verification is executed strictly outside the timer in `validate()`.
 public final class WorkloadConcurrent: HeadToHeadWorkload, @unchecked Sendable {
     public let name = "Concurrent Prefetching (32 reads, 4 lanes vs 4 handles)"
     private let archiveURL: URL
@@ -52,9 +63,6 @@ public final class WorkloadConcurrent: HeadToHeadWorkload, @unchecked Sendable {
     private var zipMelloReader: ArchiveReader?
     private var zfWorkers: [ZFArchiveWorker] = []
 
-    // Validation sinks
-    private var lastZMSHA256: String = ""
-    private var lastZFSHA256: String = ""
     private var lastZMBytes: Int = 0
     private var lastZFBytes: Int = 0
 
@@ -103,11 +111,11 @@ public final class WorkloadConcurrent: HeadToHeadWorkload, @unchecked Sendable {
         let gate = ConcurrencyGate(count: count)
 
         // Spawn tasks that synchronize at the common barrier
-        let tasks: [Task<(bytes: Int, data: Data), Error>] = paths.map { path in
+        let tasks: [Task<Int, Error>] = paths.map { path in
             Task {
                 await gate.wait()
                 let data = try await reader.read(path)
-                return (data.count, data)
+                return data.count
             }
         }
 
@@ -117,18 +125,14 @@ public final class WorkloadConcurrent: HeadToHeadWorkload, @unchecked Sendable {
         await gate.releaseWhenReady()
 
         var totalBytes = 0
-        var hasher = SHA256()
         for t in tasks {
-            let res = try await t.value
-            totalBytes &+= res.bytes
-            hasher.update(data: res.data)
+            totalBytes &+= try await t.value
         }
 
         let elapsed = clock.now - start
         let durationSec = Double(elapsed.components.seconds) + Double(elapsed.components.attoseconds) / 1e18
 
         self.lastZMBytes = totalBytes
-        self.lastZMSHA256 = hasher.finalize().map { String(format: "%02x", $0) }.joined()
         return WorkloadRunResult(durationSeconds: durationSec, sinkMetric: totalBytes)
     }
 
@@ -143,7 +147,7 @@ public final class WorkloadConcurrent: HeadToHeadWorkload, @unchecked Sendable {
         let workers = self.zfWorkers
 
         // Spawn tasks distributed round-robin across the 4 independent Archive handles
-        var tasks: [Task<(bytes: Int, data: Data), Error>] = []
+        var tasks: [Task<Int, Error>] = []
         for i in 0..<count {
             let path = paths[i]
             let worker = workers[i % 4]
@@ -159,18 +163,14 @@ public final class WorkloadConcurrent: HeadToHeadWorkload, @unchecked Sendable {
         await gate.releaseWhenReady()
 
         var totalBytes = 0
-        var hasher = SHA256()
         for t in tasks {
-            let res = try await t.value
-            totalBytes &+= res.bytes
-            hasher.update(data: res.data)
+            totalBytes &+= try await t.value
         }
 
         let elapsed = clock.now - start
         let durationSec = Double(elapsed.components.seconds) + Double(elapsed.components.attoseconds) / 1e18
 
         self.lastZFBytes = totalBytes
-        self.lastZFSHA256 = hasher.finalize().map { String(format: "%02x", $0) }.joined()
         return WorkloadRunResult(durationSeconds: durationSec, sinkMetric: totalBytes)
     }
 
@@ -183,7 +183,24 @@ public final class WorkloadConcurrent: HeadToHeadWorkload, @unchecked Sendable {
                 userInfo: [NSLocalizedDescriptionKey: "Byte mismatch: ZipMello=\(lastZMBytes), ZIPFoundation=\(lastZFBytes)"]
             )
         }
-        guard lastZMSHA256 == lastZFSHA256 else {
+
+        // Untimed separate validation pass
+        guard let reader = zipMelloReader, self.zfWorkers.count == 4 else { return }
+        var zmHasher = SHA256()
+        var zfHasher = SHA256()
+
+        for (i, path) in prefetchPaths.enumerated() {
+            let zmData = try await reader.read(path)
+            zmHasher.update(data: zmData)
+
+            let zfData = try await zfWorkers[i % 4].extractData(path)
+            zfHasher.update(data: zfData)
+        }
+
+        let zmDigest = zmHasher.finalize().map { String(format: "%02x", $0) }.joined()
+        let zfDigest = zfHasher.finalize().map { String(format: "%02x", $0) }.joined()
+
+        guard zmDigest == zfDigest else {
             throw NSError(
                 domain: "WorkloadConcurrent",
                 code: 4,

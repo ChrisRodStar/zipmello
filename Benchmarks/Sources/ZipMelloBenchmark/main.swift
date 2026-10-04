@@ -68,17 +68,24 @@ struct BenchmarkMain {
         let fixturesDir = packageDir.appendingPathComponent("Fixtures", isDirectory: true)
         let comicSourceDir = fixturesDir.appendingPathComponent("comic", isDirectory: true)
         let defaultFixtureURL = fixturesDir.appendingPathComponent("PepperAndCarrot_80P.cbz")
+        let deflateFixtureURL = fixturesDir.appendingPathComponent("PepperAndCarrot_80P_deflate.cbz")
 
         var fixtureURL = defaultFixtureURL
         if let idx = args.firstIndex(of: "--fixture"), idx + 1 < args.count {
             fixtureURL = URL(fileURLWithPath: args[idx + 1])
         } else {
             if !isJSON {
-                print("Checking benchmark fixture at \(defaultFixtureURL.lastPathComponent)...")
+                print("Checking benchmark fixtures at \(fixturesDir.lastPathComponent)...")
             }
             fixtureURL = try await FixtureGenerator.ensureFixture(
                 at: defaultFixtureURL,
-                comicSourceDir: comicSourceDir
+                comicSourceDir: comicSourceDir,
+                compression: .stored
+            )
+            _ = try await FixtureGenerator.ensureFixture(
+                at: deflateFixtureURL,
+                comicSourceDir: comicSourceDir,
+                compression: .deflate
             )
         }
 
@@ -93,20 +100,23 @@ struct BenchmarkMain {
 
         var workloads: [HeadToHeadWorkload] = []
 
-        if workloadFilter == "all" || workloadFilter.contains("random") {
-            workloads.append(WorkloadRandomAccess(archiveURL: fixtureURL, seed: seed))
-        }
         if workloadFilter == "all" || workloadFilter.contains("lookup") {
             workloads.append(WorkloadPathLookup(archiveURL: fixtureURL, seed: seed))
+        }
+        if workloadFilter == "all" || workloadFilter.contains("discovery") {
+            workloads.append(WorkloadDiscovery(archiveURL: fixtureURL))
+        }
+        if workloadFilter == "all" || workloadFilter.contains("memory") || workloadFilter.contains("stored") {
+            workloads.append(WorkloadMemory(archiveURL: fixtureURL, name: "In-Memory Extraction (50 stored pages)"))
+        }
+        if (workloadFilter == "all" || workloadFilter.contains("deflate") || workloadFilter.contains("memory")) && FileManager.default.fileExists(atPath: deflateFixtureURL.path) {
+            workloads.append(WorkloadMemory(archiveURL: deflateFixtureURL, name: "In-Memory Decompression (50 DEFLATE pages)"))
         }
         if workloadFilter == "all" || workloadFilter.contains("concurrent") {
             workloads.append(WorkloadConcurrent(archiveURL: fixtureURL))
         }
-        if workloadFilter == "all" || workloadFilter.contains("memory") {
-            workloads.append(WorkloadMemory(archiveURL: fixtureURL))
-        }
-        if workloadFilter == "all" || workloadFilter.contains("discovery") {
-            workloads.append(WorkloadDiscovery(archiveURL: fixtureURL))
+        if workloadFilter == "all" || workloadFilter.contains("random") || workloadFilter.contains("stored") {
+            workloads.append(WorkloadRandomAccess(archiveURL: fixtureURL, seed: seed, name: "Random-Access Page Reads (80 stored pages)"))
         }
 
         var results: [HeadToHeadResult] = []

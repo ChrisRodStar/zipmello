@@ -24,8 +24,8 @@ public enum BenchmarkFormatter {
         results: [HeadToHeadResult],
         leasingResult: LeasingResult?
     ) {
-        let separator = String(repeating: "=", count: 104)
-        let subSeparator = String(repeating: "-", count: 104)
+        let separator = String(repeating: "=", count: 125)
+        let subSeparator = String(repeating: "-", count: 125)
 
         print("\n" + separator)
         print("ZipMello vs ZIPFoundation (0.9.20) — Manga & Comic Reader Benchmark Suite")
@@ -40,18 +40,18 @@ public enum BenchmarkFormatter {
         print("  SHA-256:    \(env.fixtureHash)")
         print(separator)
         print("Head-to-Head Engine Benchmarks (Pre-indexed lookup, 64 KB decompression buffers, CRC verified):")
-        let h1 = padRight("Benchmark", 48)
-        let h2 = padLeft("ZIPFoundation 0.9.20", 24)
-        let h3 = padLeft("ZipMello", 18)
-        let h4 = padLeft("Speedup (Median)", 12)
+        let h1 = padRight("Benchmark", 56)
+        let h2 = padLeft("ZIPFoundation 0.9.20", 25)
+        let h3 = padLeft("ZipMello", 25)
+        let h4 = padLeft("Speedup (Median)", 16)
         print("\(h1) \(h2) \(h3) \(h4)")
         print(subSeparator)
 
         for res in results {
-            let col1 = padRight(res.benchmarkName, 48)
-            let col2 = padLeft(res.baseline.formattedDuration, 24)
-            let col3 = padLeft(res.candidate.formattedDuration, 18)
-            let col4 = padLeft(res.formattedSpeedup, 12)
+            let col1 = padRight(res.benchmarkName, 56)
+            let col2 = padLeft(res.baseline.formattedDuration, 25)
+            let col3 = padLeft(res.candidate.formattedDuration, 25)
+            let col4 = padLeft(res.formattedSpeedup, 16)
             print("\(col1) \(col2) \(col3) \(col4)")
         }
 
@@ -63,6 +63,7 @@ public enum BenchmarkFormatter {
             print("  Viewport Steps Traversed: \(lease.stepsTraversed) (forward scroll, backtracks, reverse scroll)")
             print("  Peak Concurrent Leases:   \(lease.peakConcurrentLeases) pages (retained viewport window)")
             print("  Cache Telemetry:          \(lease.cacheHits) hits, \(lease.cacheMisses) misses (extractions), \(lease.evictions) evictions")
+            print("  Queue Backpressure:       \(lease.queuedRequests) queued requests (peak depth: \(lease.peakQueueDepth)), \(lease.cancelledBeforeExtraction) cancelled")
             print(String(format: "  Peak Memory / Disk:       %.2f MB Peak Cached Bytes | %.2f MB Peak Disk Footprint", lease.peakCachedMB, lease.peakDiskFootprintMB))
             print(String(format: "  Cache-Hit Lease Latency:  %.3f ms ± %.3f ms MAD", lease.hitLatency.median * 1000.0, lease.hitLatency.mad * 1000.0))
             print(String(format: "  Cache-Miss Lease Latency: %.2f ms ± %.2f ms MAD (includes disk extraction)", lease.missLatency.median * 1000.0, lease.missLatency.mad * 1000.0))
