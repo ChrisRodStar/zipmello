@@ -8,7 +8,7 @@
 
 <p align="center">
   <a href="https://github.com/ChrisRodStar/zipmello/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/ChrisRodStar/zipmello/ci.yml?branch=main&label=CI&style=flat-square&color=22c55e" alt="CI Status"></a>
-  <a href="https://github.com/ChrisRodStar/zipmello/releases/tag/v1.0.0"><img src="https://img.shields.io/github/v/release/ChrisRodStar/zipmello?style=flat-square&label=Release&color=F5C77E" alt="Release v1.0.0"></a>
+  <a href="https://github.com/ChrisRodStar/zipmello/releases/tag/v1.1.0"><img src="https://img.shields.io/github/v/release/ChrisRodStar/zipmello?style=flat-square&label=Release&color=F5C77E" alt="Release v1.1.0"></a>
   <img src="https://img.shields.io/badge/Swift-6.0%20Strict-F05138?style=flat-square&logo=swift&logoColor=white" alt="Swift 6.0 Strict">
   <img src="https://img.shields.io/badge/Platforms-macOS%20%7C%20iOS%20%7C%20tvOS%20%7C%20watchOS%20%7C%20visionOS-1C1B1A?style=flat-square" alt="Platforms">
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-blue.svg?style=flat-square" alt="MIT License"></a>
@@ -126,7 +126,7 @@ Add ZipMello to your `Package.swift`:
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/ChrisRodStar/zipmello.git", from: "1.0.0")
+    .package(url: "https://github.com/ChrisRodStar/zipmello.git", from: "1.1.0")
 ]
 ```
 
