@@ -3,6 +3,6 @@
 .DS_Store
 
 # Local developer tools and benchmark suites (preserved locally, untracked on GitHub)
-Benchmarks/
+old-Benchmarks/
 Tools/
-
+Benchmarks/Fixtures/*.cbz

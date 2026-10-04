@@ -16,26 +16,35 @@
 
 ---
 
-**ZipMello** is a Swift 6 ZIP/CBZ engine built around the access patterns of comic and manga readers. It uses positional archive reads for concurrent page access, natural page ordering, bounded page leasing for scroll views, and direct in-memory archive processing.
+**ZipMello** is a Swift 6 ZIP/CBZ engine built around the access patterns of comic and manga readers. It uses seek-lock-free positional archive reads for concurrent page access, natural page ordering, bounded page leasing for scroll views, and direct in-memory archive processing.
 
 ## Reader Benchmarks
 
-Measured head-to-head on Apple Silicon comparing ZipMello 1.0.0 against [ZIPFoundation 0.9.20](https://github.com/weichsel/ZIPFoundation):
+Measured head-to-head on Apple Silicon (Apple M3, Release mode) comparing ZipMello against [ZIPFoundation 0.9.20](https://github.com/weichsel/ZIPFoundation) using an 80-page CBZ chapter fixture (10 paired samples, median ± MAD):
 
-| Benchmark | ZIPFoundation 0.9.20 | ZipMello 1.0.0 | Speedup |
+| Benchmark | ZIPFoundation 0.9.20 | ZipMello | Speedup |
 | :--- | ---: | ---: | ---: |
-| **Random-Access Page Reads**<br><sub>80 pages directly from .cbz</sub> | 17.0 ms | **3.2 ms** | **5.31×** |
-| **Concurrent Prefetching**<br><sub>32 concurrent page reads</sub> | 7.1 ms | **1.4 ms** | **4.93×** |
-| **In-Memory Volume Extraction**<br><sub>50 entries, zero disk I/O</sub> | 6.3 ms | **2.0 ms** | **3.15×** |
-| **Directory Extraction**<br><sub>500 files, 50 MB to disk</sub> | 83.2 ms | **40.0 ms** | **2.08×** |
-| **Central Directory Inspection**<br><sub>5,000 entries</sub> | 14.2 ms | **8.0 ms** | **1.78×** |
+| **Path Lookup by Name**<br><sub>80 lookups across chapter</sub> | 14.22 ms ± 0.04 ms | **0.26 ms ± 0.00 ms** | **54.86×** |
+| **Library Discovery**<br><sub>Open + Cover + ComicInfo.xml</sub> | 0.66 ms ± 0.00 ms | **0.35 ms ± 0.00 ms** | **1.93×** |
+| **In-Memory Decompression**<br><sub>50 pages, zero disk I/O</sub> | 5.18 ms ± 0.01 ms | **5.06 ms ± 0.00 ms** | **1.02×** |
+| **Concurrent Prefetching**<br><sub>32 reads across 4 threads</sub> | 2.87 ms ± 0.01 ms | 2.95 ms ± 0.00 ms | 0.97× |
+| **Random-Access Page Reads**<br><sub>80 pages directly from disk</sub> | 8.90 ms ± 0.02 ms | 9.52 ms ± 0.01 ms | 0.94× |
+
+Run locally with one command:
+
+```bash
+swift run --package-path Benchmarks -c release
+```
+
+*See [Benchmarks/README.md](Benchmarks/README.md) for full methodology, hardware environment, cache eviction benchmarks, and JSON options.*
 
 ## Key Features
 
-- **Lock-Free Positional Reads**: Independent `pread` calls allow background tasks to prefetch future pages without locking the file handle or stalling the main thread.
-- **Natural Page Sorting**: Pages sort via `localizedStandardCompare` so `page2.jpg` precedes `page10.jpg`, automatically filtering out `__MACOSX`, dot-underscore files, and `.DS_Store`.
-- **Bounded Page Leasing (`ArchivePageStore`)**: Reference-counted page leasing with bounded disk usage and LRU eviction, keeping files on disk while visible in scroll views.
-- **Zero-Disk Streaming**: Parse and decompress downloaded `.cbz` payloads directly from `Data` buffers without writing temporary files to flash storage.
+- **Seek-Lock-Free Positional Reads**: Independent `pread` calls allow background tasks to prefetch future pages concurrently without serializing on a shared file seek offset or stalling the main thread.
+- **Average O(1) Path Indexing**: Parses the ZIP central directory once at open, avoiding repeated linear scans when requesting pages out of order.
+- **Natural Page Sorting**: Sorts entries via natural numerical ordering so `page2.jpg` precedes `page10.jpg`, automatically filtering out `__MACOSX`, dot-underscore files, and `.DS_Store`.
+- **Bounded Page Leasing (`ArchivePageStore`)**: Reference-counted page leasing with bounded disk budgets and automatic LRU eviction, keeping files on disk while visible in scroll viewports.
+- **Zero-Disk Streaming**: Parse and decompress downloaded `.cbz` payloads directly from `Data` buffers without spooling temporary files to flash storage.
 - **Hardened `ComicInfo.xml`**: Parses and serializes ComicRack metadata with built-in XXE and expansion bomb protection.
 
 ## Quickstart

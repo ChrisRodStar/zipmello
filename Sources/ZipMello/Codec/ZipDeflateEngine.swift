@@ -91,7 +91,7 @@ enum ZipDeflateEngine {
 
                 let produced = bufferBytes - Int(strm.avail_out)
                 if produced > 0 {
-                    let outputData = Data(bytesNoCopy: outBuffer, count: produced, deallocator: .none)
+                    let outputData = Data(bytes: outBuffer, count: produced)
                     try consumer(outputData)
                     if !skipCRC {
                         crc = ZipChecksum.update(current: crc, data: outputData)
@@ -194,7 +194,7 @@ enum ZipDeflateEngine {
 
                     let produced = bufferBytes - Int(strm.avail_out)
                     if produced > 0 {
-                        let outputData = Data(bytesNoCopy: outBuffer, count: produced, deallocator: .none)
+                        let outputData = Data(bytes: outBuffer, count: produced)
                         try consumer(outputData)
                     }
 
@@ -215,7 +215,7 @@ enum ZipDeflateEngine {
 
                 let produced = bufferBytes - Int(strm.avail_out)
                 if produced > 0 {
-                    let outputData = Data(bytesNoCopy: outBuffer, count: produced, deallocator: .none)
+                    let outputData = Data(bytes: outBuffer, count: produced)
                     try consumer(outputData)
                 }
 

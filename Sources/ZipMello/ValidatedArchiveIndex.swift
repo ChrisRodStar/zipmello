@@ -77,7 +77,15 @@ struct ValidatedArchiveIndex: Sendable {
                     throw ArchiveFailure.invalidSource(path)
                 }
 
-                let method: ArchiveCompression = (entry.compressionMethod == 8) ? .deflate : .stored
+                let method: ArchiveCompression
+                switch entry.compressionMethod {
+                case 0:
+                    method = .stored
+                case 8:
+                    method = .deflate
+                default:
+                    throw ArchiveFailure.unsupportedEntry("Compression method \(entry.compressionMethod) for '\(path)'")
+                }
                 let descriptor = ArchiveReadDescriptor(
                     offset: offset,
                     compressedBytes: entry.compressedSize,

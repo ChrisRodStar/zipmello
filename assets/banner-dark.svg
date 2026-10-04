@@ -56,7 +56,7 @@
     <!-- Architectural Spec Line (Refined & Clean) -->
     <g transform="translate(0, 146)">
       <text x="0" y="14" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'SF Mono', 'Inter', monospace" font-size="13" font-weight="500" fill="#71717A">
-        <tspan fill="#FCE5B5" font-weight="700">5.31×</tspan> Faster Page Reads &#160;&#160;·&#160;&#160; 
+        <tspan fill="#FCE5B5" font-weight="700">5.78×</tspan> Faster Page Reads &#160;&#160;·&#160;&#160; 
         <tspan fill="#FCE5B5" font-weight="700">Zero</tspan> Disk Spool &#160;&#160;·&#160;&#160; 
         <tspan fill="#FCE5B5" font-weight="700">Native</tspan> ZIP64
       </text>

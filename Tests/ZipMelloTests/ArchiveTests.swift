@@ -53,6 +53,22 @@ struct ArchiveTests {
     }
 
     @Test
+    func rejectsUnsupportedCompressionMethod() async throws {
+        let work = try Workspace()
+        let file = work.file("unsupported.zip")
+        try await ArchiveWriter().create(at: file, assets: [.init(path: "page.txt", content: .bytes(Data("hello".utf8)), compression: .stored)])
+        var bytes = try Data(contentsOf: file)
+        let cdMagic = Data([0x50, 0x4b, 0x01, 0x02])
+        let range = try #require(bytes.range(of: cdMagic))
+        bytes[range.lowerBound + 10] = 9
+        bytes[range.lowerBound + 11] = 0
+        try bytes.write(to: file)
+        await #expect(throws: ArchiveFailure.unsupportedEntry("Compression method 9 for 'page.txt'")) {
+            try await ArchiveReader.open(file)
+        }
+    }
+
+    @Test
     func rejectsSymlinksOnOpen() async throws {
         let work = try Workspace()
         let file = work.file("link.zip")

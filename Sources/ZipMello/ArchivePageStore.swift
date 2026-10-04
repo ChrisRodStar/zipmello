@@ -113,6 +113,8 @@ public actor ArchivePageStore {
     private var tick: UInt64 = 0
     private var epoch: UInt64 = 0
     private var extractionCount: UInt64 = 0
+    private var hitCount: UInt64 = 0
+    private var evictionCount: UInt64 = 0
 
     /// Initializes a page store with byte and file bounds in a designated working directory.
     public init(
@@ -162,6 +164,7 @@ public actor ArchivePageStore {
         let key = Key(url: url, path: path, identity: identity)
 
         if let id = keys[key], let cached = entries[id], FileManager.default.fileExists(atPath: cached.url.path) {
+            hitCount += 1
             return acquire(id)
         }
 
@@ -298,6 +301,7 @@ public actor ArchivePageStore {
         guard let cached = entries.removeValue(forKey: id) else {
             return
         }
+        evictionCount += 1
         if keys[cached.key] == id {
             keys[cached.key] = nil
         }
@@ -321,12 +325,30 @@ public actor ArchivePageStore {
         await pool.removeAll()
     }
 
-    /// Statistics on active leases, cached files, and extraction operations.
+    /// Statistics on active leases, cached files, extraction operations, hits, and evictions.
     public struct Statistics: Sendable {
         public let files: Int
         public let bytes: UInt64
         public let activeLeases: Int
         public let extractions: UInt64
+        public let hits: UInt64
+        public let evictions: UInt64
+
+        public init(
+            files: Int,
+            bytes: UInt64,
+            activeLeases: Int,
+            extractions: UInt64,
+            hits: UInt64 = 0,
+            evictions: UInt64 = 0
+        ) {
+            self.files = files
+            self.bytes = bytes
+            self.activeLeases = activeLeases
+            self.extractions = extractions
+            self.hits = hits
+            self.evictions = evictions
+        }
     }
 
     /// Returns a telemetry snapshot of page store usage.
@@ -335,7 +357,9 @@ public actor ArchivePageStore {
             files: entries.count,
             bytes: calculateAllocatedBytes(),
             activeLeases: leases.count,
-            extractions: extractionCount
+            extractions: extractionCount,
+            hits: hitCount,
+            evictions: evictionCount
         )
     }
 }
