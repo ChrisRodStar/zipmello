@@ -95,7 +95,8 @@ public actor ArchivePageStore {
     private struct Pending {
         let id: UUID
         let epoch: UInt64
-        let task: Task<Prepared, Error>
+        let task: Task<Void, Never>
+        var waiters: [UUID: CheckedContinuation<ArchiveFileLease, Error>]
     }
 
     private let directory: URL
@@ -107,8 +108,10 @@ public actor ArchivePageStore {
     private var entries: [UUID: Cached] = [:]
     private var keys: [Key: UUID] = [:]
     private var pending: [Key: Pending] = [:]
+    private var extractionTasks: [UUID: Task<Void, Never>] = [:]
     private var reservations: [UUID: UInt64] = [:]
-    private var waiters: [UUID: Int] = [:]
+    private var resolvedKeys: [Key: Key] = [:]
+    private var allocatedBytes: UInt64 = 0
     private var leases: [UUID: UUID] = [:]
     private var tick: UInt64 = 0
     private var epoch: UInt64 = 0
@@ -211,129 +214,158 @@ public actor ArchivePageStore {
         lookup: ArchiveLookup
     ) async throws -> ArchiveFileLease {
         try Task.checkCancellation()
-        let key = Key(url: url, path: path, identity: identity)
+        let request = Key(url: url, path: path, identity: identity)
+        var key = lookup == .compatible ? resolvedKeys[request] ?? request : request
+        if let lease = cachedLease(key) { return lease }
 
-        if let id = keys[key], let cached = entries[id], FileManager.default.fileExists(atPath: cached.url.path) {
+        let currentEpoch = epoch
+        var member: ArchiveMember?
+        if pending[key] == nil {
+            let resolved = try await resolveMember(path, from: url, lookup: lookup, epoch: currentEpoch)
+            try Task.checkCancellation()
+            guard currentEpoch == epoch else { throw CancellationError() }
+            guard identity.matches(url: url) else {
+                throw ArchiveFailure.invalidSource("Archive changed before extraction")
+            }
+            guard !resolved.isDirectory else { throw ArchiveFailure.unsupportedEntry(path) }
+            key = Key(url: url, path: resolved.path, identity: identity)
+            if lookup == .compatible {
+                if resolvedKeys.count >= maximumFiles { resolvedKeys.removeAll(keepingCapacity: true) }
+                resolvedKeys[request] = key
+            }
+            if let lease = cachedLease(key) { return lease }
+            member = resolved
+        }
+
+        let resolvedKey = key
+        let resolvedMember = member
+        let ticket = UUID()
+        let lease = try await withTaskCancellationHandler {
+            try Task.checkCancellation()
+            return try await withCheckedThrowingContinuation { continuation in
+                if var item = pending[resolvedKey] {
+                    item.waiters[ticket] = continuation
+                    pending[resolvedKey] = item
+                    return
+                }
+                // New work always has metadata resolved under this caller's lookup policy.
+                guard let member = resolvedMember else {
+                    continuation.resume(throwing: CancellationError())
+                    return
+                }
+                let id = UUID()
+                let task = Task { [self] in
+                    do {
+                        let file = try await prepare(member, key: resolvedKey, id: id, epoch: currentEpoch)
+                        finish(resolvedKey, id: id, epoch: currentEpoch, result: .success(file))
+                    } catch {
+                        finish(resolvedKey, id: id, epoch: currentEpoch, result: .failure(error))
+                    }
+                }
+                pending[resolvedKey] = Pending(id: id, epoch: currentEpoch, task: task, waiters: [ticket: continuation])
+                extractionTasks[id] = task
+                extractionCount += 1
+            }
+        } onCancel: {
+            Task { await self.cancelLeaseWaiter(resolvedKey, ticket: ticket) }
+        }
+        if Task.isCancelled {
+            await lease.release()
+            throw CancellationError()
+        }
+        return lease
+    }
+
+    private func cachedLease(_ key: Key) -> ArchiveFileLease? {
+        guard let id = keys[key], var cached = entries[id] else { return nil }
+        if FileManager.default.fileExists(atPath: cached.url.path) {
             hitCount += 1
             return acquire(id)
         }
+        keys[key] = nil
+        cached.retired = true
+        entries[id] = cached
+        if cached.leases == 0 { evict(id) }
+        return nil
+    }
 
-        if let id = keys.removeValue(forKey: key), var cached = entries[id] {
-            cached.retired = true
-            entries[id] = cached
-            if cached.leases == 0 {
-                evict(id)
-            }
-        }
+    private func resolveMember(_ path: String, from url: URL, lookup: ArchiveLookup, epoch: UInt64) async throws -> ArchiveMember {
+        // Opening metadata also uses a permit so requests across many archives remain bounded.
+        try await acquireExtractionPermit()
+        defer { releaseExtractionPermit() }
+        try Task.checkCancellation()
+        guard epoch == self.epoch else { throw CancellationError() }
+        return try await pool.member(path, from: url, lookup: lookup)
+    }
 
-        let item: Pending
-        if let existing = pending[key] {
-            item = existing
-        } else {
-            let id = UUID()
-            let currentEpoch = epoch
-            let pool = pool
-            let directory = directory
-
-            let task = Task { [self] in
-                try await self.acquireExtractionPermit()
-                var permitHeld = true
-                do {
-                    try Task.checkCancellation()
-                    let member = try await pool.member(path, from: url, lookup: lookup)
-                    guard !member.isDirectory else {
-                        throw ArchiveFailure.unsupportedEntry(path)
-                    }
-                    try Task.checkCancellation()
-                    try self.reserve(member.uncompressedBytes, id: id, epoch: currentEpoch)
-                    let ext = URL(fileURLWithPath: member.path).pathExtension
-                    let output = directory.appendingPathComponent(id.uuidString).appendingPathExtension(ext)
-                    do {
-                        try await pool.extract(member.path, from: url, to: output, durability: .buffered)
-                        try Task.checkCancellation()
-                        guard try ArchiveFileIdentity(url) == key.identity else {
-                            throw ArchiveFailure.invalidSource("Archive changed during extraction")
-                        }
-                        self.releaseExtractionPermit()
-                        permitHeld = false
-                        return Prepared(url: output, bytes: member.uncompressedBytes)
-                    } catch {
-                        try? FileManager.default.removeItem(at: output)
-                        throw error
-                    }
-                } catch {
-                    if permitHeld {
-                        self.releaseExtractionPermit()
-                    }
-                    throw error
-                }
-            }
-            item = Pending(id: id, epoch: currentEpoch, task: task)
-            pending[key] = item
-            extractionCount += 1
-        }
-
-        waiters[item.id, default: 0] += 1
-        defer {
-            let remaining = (waiters[item.id] ?? 1) - 1
-            waiters[item.id] = remaining == 0 ? nil : remaining
-            if remaining == 0, let cached = entries[item.id], cached.retired && cached.leases == 0 {
-                evict(item.id)
-            }
-        }
-
+    private func prepare(_ member: ArchiveMember, key: Key, id: UUID, epoch: UInt64) async throws -> Prepared {
+        try await acquireExtractionPermit()
+        defer { releaseExtractionPermit() }
+        try Task.checkCancellation()
+        try reserve(member.uncompressedBytes, id: id, epoch: epoch)
+        let ext = URL(fileURLWithPath: member.path).pathExtension
+        let output = directory.appendingPathComponent(id.uuidString).appendingPathExtension(ext)
         do {
-            let file = try await item.task.value
-            guard item.epoch == epoch else {
-                try? FileManager.default.removeItem(at: file.url)
-                throw CancellationError()
-            }
-            if entries[item.id] == nil {
-                reservations[item.id] = nil
-                entries[item.id] = Cached(
-                    key: key,
-                    url: file.url,
-                    bytes: file.bytes,
-                    leases: 0,
-                    lastUse: tick,
-                    retired: false
-                )
-                keys[key] = item.id
-            }
-            if pending[key]?.id == item.id {
-                pending[key] = nil
-            }
+            try await pool.extract(member.path, from: key.url, to: output, durability: .buffered)
             try Task.checkCancellation()
-            return acquire(item.id)
-        } catch {
-            reservations[item.id] = nil
-            if pending[key]?.id == item.id {
-                pending[key] = nil
+            guard key.identity.matches(url: key.url) else {
+                throw ArchiveFailure.invalidSource("Archive changed during extraction")
             }
+            return Prepared(url: output, bytes: member.uncompressedBytes)
+        } catch {
+            try? FileManager.default.removeItem(at: output)
             throw error
         }
     }
 
-    private func calculateAllocatedBytes() -> UInt64 {
-        entries.values.reduce(UInt64(0)) { $0 + $1.bytes } + reservations.values.reduce(UInt64(0), +)
+    private func cancelLeaseWaiter(_ key: Key, ticket: UUID) {
+        guard var item = pending[key], let waiter = item.waiters.removeValue(forKey: ticket) else { return }
+        waiter.resume(throwing: CancellationError())
+        if item.waiters.isEmpty {
+            item.task.cancel()
+            pending[key] = nil
+            // The task retains its reservation until it has stopped writing.
+        } else {
+            pending[key] = item
+        }
     }
 
-    fileprivate func reserve(_ bytes: UInt64, id: UUID, epoch: UInt64) throws {
-        guard epoch == self.epoch else {
-            throw CancellationError()
+    private func finish(_ key: Key, id: UUID, epoch: UInt64, result: Result<Prepared, Error>) {
+        extractionTasks[id] = nil
+        guard let item = pending[key], item.id == id, epoch == self.epoch else {
+            releaseReservation(id)
+            if case .success(let file) = result { try? FileManager.default.removeItem(at: file.url) }
+            return
         }
-        guard bytes <= maximumBytes else {
-            throw ArchiveFailure.cacheCapacityExceeded
+        pending[key] = nil
+        switch result {
+        case .success(let file):
+            // Transfer the reservation to a cached entry without changing allocatedBytes.
+            reservations[id] = nil
+            entries[id] = Cached(key: key, url: file.url, bytes: file.bytes, lastUse: tick, retired: false)
+            keys[key] = id
+            for waiter in item.waiters.values { waiter.resume(returning: acquire(id)) }
+        case .failure(let error):
+            releaseReservation(id)
+            for waiter in item.waiters.values { waiter.resume(throwing: error) }
         }
+    }
 
-        while calculateAllocatedBytes() > maximumBytes - bytes || entries.count + reservations.count >= maximumFiles {
-            let evictable = entries.filter { $0.value.leases == 0 && waiters[$0.key, default: 0] == 0 }
-            guard let victim = evictable.min(by: { $0.value.lastUse < $1.value.lastUse })?.key else {
-                throw ArchiveFailure.cacheCapacityExceeded
-            }
+    private func releaseReservation(_ id: UUID) {
+        if let bytes = reservations.removeValue(forKey: id) { allocatedBytes -= bytes }
+    }
+
+    private func reserve(_ bytes: UInt64, id: UUID, epoch: UInt64) throws {
+        guard epoch == self.epoch else { throw CancellationError() }
+        guard bytes <= maximumBytes else { throw ArchiveFailure.cacheCapacityExceeded }
+        while allocatedBytes > maximumBytes - bytes || entries.count + reservations.count >= maximumFiles {
+            let victim = entries.lazy.filter { $0.value.leases == 0 }
+                .min(by: { $0.value.lastUse < $1.value.lastUse })?.key
+            guard let victim else { throw ArchiveFailure.cacheCapacityExceeded }
             evict(victim)
         }
         reservations[id] = bytes
+        allocatedBytes += bytes
     }
 
     private func acquire(_ id: UUID) -> ArchiveFileLease {
@@ -360,6 +392,7 @@ public actor ArchivePageStore {
         guard let cached = entries.removeValue(forKey: id) else {
             return
         }
+        allocatedBytes -= cached.bytes
         evictionCount += 1
         if keys[cached.key] == id {
             keys[cached.key] = nil
@@ -371,25 +404,26 @@ public actor ArchivePageStore {
     public func removeAll() async {
         epoch &+= 1
         keys.removeAll()
+        resolvedKeys.removeAll()
+        let tasks = Array(extractionTasks.values)
+        for task in tasks { task.cancel() }
         for item in pending.values {
             item.task.cancel()
+            for waiter in item.waiters.values { waiter.resume(throwing: CancellationError()) }
         }
         pending.removeAll()
-
-        for continuation in permitWaiters.values {
-            continuation.resume(throwing: CancellationError())
-        }
+        cancelledBeforeExtractionCount += UInt64(permitQueue.count)
+        for waiter in permitWaiters.values { waiter.resume(throwing: CancellationError()) }
         permitWaiters.removeAll()
         permitQueue.removeAll()
-        inFlightExtractions = 0
 
+        // Active tasks still own permits. They release them while draining, including across epochs.
         for id in Array(entries.keys) {
             entries[id]?.retired = true
-            if entries[id]?.leases == 0 {
-                evict(id)
-            }
+            if entries[id]?.leases == 0 { evict(id) }
         }
         await pool.removeAll()
+        for task in tasks { await task.value }
     }
 
     /// Statistics on active leases, cached files, extraction operations, hits, and evictions.
@@ -431,7 +465,7 @@ public actor ArchivePageStore {
     public func statistics() -> Statistics {
         Statistics(
             files: entries.count,
-            bytes: calculateAllocatedBytes(),
+            bytes: allocatedBytes,
             activeLeases: leases.count,
             extractions: extractionCount,
             hits: hitCount,

@@ -42,11 +42,11 @@ swift run --package-path Benchmarks -c release
 ## Key Features
 
 - **Seek-Lock-Free Positional Reads**: Independent `pread` calls allow background tasks to prefetch future pages concurrently without serializing on a shared file seek offset or stalling the main thread.
-- **Average O(1) Path Indexing**: Parses the ZIP central directory once at open, avoiding repeated linear scans when requesting pages out of order.
+- **Average O(1) Path & Alias Indexing**: Parses the central directory once at open, precomputing canonical and percent-decoded aliases to avoid linear scans on non-exact page requests.
 - **Natural Page Sorting**: Sorts entries via natural numerical ordering so `page2.jpg` precedes `page10.jpg`, automatically filtering out `__MACOSX`, dot-underscore files, and `.DS_Store`.
-- **Bounded Page Leasing (`ArchivePageStore`)**: Reference-counted page leasing with bounded disk budgets and automatic LRU eviction, keeping files on disk while visible in scroll viewports.
+- **Bounded Page Leasing (`ArchivePageStore`)**: Reference-counted page leasing with bounded disk budgets, responsive cancellation during rapid scrolling, and automatic LRU eviction to keep visible viewport pages hot on disk.
 - **Zero-Disk Streaming**: Parse and decompress downloaded `.cbz` payloads directly from `Data` buffers without spooling temporary files to flash storage.
-- **Hardened `ComicInfo.xml`**: Parses and serializes ComicRack metadata with built-in XXE and expansion bomb protection.
+- **Hardened Validation**: Preflights entry counts against central-directory capacity to prevent allocation traps, strictly bounds ZIP64 extra fields, verifies exact DEFLATE output boundaries, and serializes ComicRack metadata with XXE protection.
 
 ## Quickstart
 

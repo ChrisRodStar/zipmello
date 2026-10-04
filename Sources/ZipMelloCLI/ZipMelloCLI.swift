@@ -4,7 +4,16 @@ import ZipMello
 /// Command-line interface utility for inspecting, validating, extracting, and creating ZIP and CBZ archives.
 @main
 struct ZipMelloCLI {
-    static func main() async throws {
+    static func main() async {
+        do {
+            try await run()
+        } catch {
+            FileHandle.standardError.write(Data("zipmello: \(error)\n".utf8))
+            exit(1)
+        }
+    }
+
+    private static func run() async throws {
         let args = Array(CommandLine.arguments.dropFirst())
         guard let command = args.first else {
             printUsage()

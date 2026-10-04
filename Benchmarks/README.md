@@ -27,7 +27,7 @@ Measured on Apple Silicon (Apple M3, 8 GB RAM, macOS 15, Release `-O` build, war
 | :--- | ---: | ---: | ---: | :--- |
 | **Path Lookup by Name** | 11.46 ms ± 0.12 ms | **0.21 ms ± 0.00 ms** | **55.02×** | 80 path queries; ZipMello average $O(1)$ index vs ZIPFoundation stock $O(N)$ linear scans |
 | **Library Discovery** | 0.66 ms ± 0.01 ms | **0.28 ms ± 0.00 ms** | **2.33×** | Open archive + index central directory + extract cover + parse `ComicInfo.xml` |
-| **In-Memory Extraction (Stored)** | 0.90 ms ± 0.02 ms | **0.56 ms ± 0.02 ms** | **1.63×** | 50 stored pages read directly into uninitialized zero-copy buffer |
+| **In-Memory Extraction (Stored)** | 0.90 ms ± 0.02 ms | **0.56 ms ± 0.02 ms** | **1.63×** | 50 stored pages read directly into zero-copy buffer with verified bounds |
 | **In-Memory Decompression (DEFLATE)** | 44.18 ms ± 0.15 ms | **24.04 ms ± 0.18 ms** | **1.84×** | 50 DEFLATE pages decompressed into preallocated buffer via single-pass inflate |
 | **Concurrent Prefetching** | 0.26 ms ± 0.00 ms | **0.25 ms ± 0.01 ms** | **1.03×** | 32 simultaneous page extractions across 4 read lanes vs 4 independent archive handles |
 | **Random-Access Page Reads** | 1.95 ms ± 0.07 ms | **1.73 ms ± 0.02 ms** | **1.11×** | 80 page extractions directly from disk with pre-indexed entries |
@@ -41,7 +41,7 @@ Evaluates ZipMello's [ArchivePageStore](../Sources/ZipMello/ArchivePageStore.swi
 - **Access Pattern**: 108 viewport steps combining forward reading, small 4-page backtracks, and reverse scrolling.
 - **Viewport Window**: 6 concurrent pages retained at any point.
 - **Cache Bounds**: 6.0 MB maximum memory/disk budget, 24 maximum files.
-- **Concurrency**: `maximumExtractions: 6` backed by an asynchronous permit queue with task cancellation.
+- **Concurrency**: `maximumExtractions: 6` backed by an asynchronous permit queue with cooperative task cancellation.
 
 | Metric | Measured Value | Description |
 | :--- | ---: | :--- |

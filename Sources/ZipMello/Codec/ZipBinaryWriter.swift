@@ -1,5 +1,6 @@
 import Foundation
 import SystemPackage
+import zlib
 
 /// High-speed native binary stream writer for ZIP and CBZ archive creation.
 ///
@@ -10,6 +11,31 @@ import SystemPackage
 /// - Section 4.3.15: ZIP64 End of Central Directory Locator (20 bytes)
 /// - Section 4.3.16: End of Central Directory Record (22 bytes)
 struct ZipBinaryWriter {
+    /// Tracks the physical extent; header patches do not consume the append budget twice.
+    private final class Output {
+        let handle: FileHandle
+        let maximumBytes: UInt64
+        var offset: UInt64 = 0
+
+        init(url: URL, maximumBytes: UInt64) throws {
+            handle = try FileHandle(forWritingTo: url)
+            self.maximumBytes = maximumBytes
+        }
+        func write(contentsOf data: Data) throws {
+            try Task.checkCancellation()
+            guard offset <= maximumBytes, UInt64(data.count) <= maximumBytes - offset else {
+                throw ArchiveFailure.archiveTooLarge
+            }
+            try handle.write(contentsOf: data)
+            offset += UInt64(data.count)
+        }
+        func seek(toOffset position: UInt64) throws {
+            try handle.seek(toOffset: position)
+            offset = position
+        }
+        func close() throws { try handle.close() }
+    }
+
     /// In-flight metadata captured while streaming entries, used to construct central directory records.
     struct WrittenEntry: Sendable {
         let path: String
@@ -19,6 +45,7 @@ struct ZipBinaryWriter {
         let uncompressedSize: UInt64
         let localHeaderOffset: UInt64
         let isDirectory: Bool
+        var usesZIP64: Bool = false
     }
 
     /// Serializes assets sequentially into a staging file at `stagingURL`.
@@ -40,7 +67,7 @@ struct ZipBinaryWriter {
         progress: ArchiveProgressHandler?,
         totalBytes: UInt64
     ) throws {
-        let handle = try FileHandle(forWritingTo: stagingURL)
+        let handle = try Output(url: stagingURL, maximumBytes: limits.maximumArchiveBytes)
         defer {
             try? handle.close()
         }
@@ -66,12 +93,14 @@ struct ZipBinaryWriter {
             let method: UInt16 = isDirectory ? 0 : (asset.compression == .deflate ? 8 : 0)
 
             let localHeaderOffset = currentOffset
+            let usesZIP64 = requiresZIP64LocalHeader(size: uncompressedSize, method: method)
 
             // 1. Write initial Local File Header with zeroed size/CRC placeholders.
             let headerSize = try writeLocalFileHeader(
                 handle: handle,
                 nameData: nameData,
-                method: method
+                method: method,
+                zip64: usesZIP64
             )
             currentOffset += headerSize
 
@@ -96,7 +125,9 @@ struct ZipBinaryWriter {
                     crc: crc,
                     payloadBytes: payloadBytes,
                     uncompressedSize: uncompressedSize,
-                    currentOffset: currentOffset
+                    currentOffset: currentOffset,
+                    nameLength: nameData.count,
+                    zip64: usesZIP64
                 )
             }
 
@@ -107,7 +138,8 @@ struct ZipBinaryWriter {
                 compressedSize: payloadBytes,
                 uncompressedSize: uncompressedSize,
                 localHeaderOffset: localHeaderOffset,
-                isDirectory: isDirectory
+                isDirectory: isDirectory,
+                usesZIP64: usesZIP64
             ))
 
             processedBytes += uncompressedSize
@@ -132,7 +164,8 @@ struct ZipBinaryWriter {
         let centralDirectorySize = centralDirectoryBytesWritten
 
         // Determine if ZIP64 format is necessary (counts >= 65535 or sizes >= 4GB).
-        let isZip64 = writtenEntries.count >= 0xFFFF
+        let isZip64 = writtenEntries.contains { $0.usesZIP64 }
+            || writtenEntries.count >= 0xFFFF
             || centralDirectoryStartOffset >= 0xFFFFFFFF
             || centralDirectorySize >= 0xFFFFFFFF
 
@@ -164,38 +197,55 @@ struct ZipBinaryWriter {
     ///
     /// APPNOTE.TXT Section 4.3.7: 30 bytes fixed header followed by filename bytes.
     private static func writeLocalFileHeader(
-        handle: FileHandle,
+        handle: Output,
         nameData: Data,
-        method: UInt16
+        method: UInt16,
+        zip64: Bool
     ) throws -> UInt64 {
-        let headerSize: UInt64 = 30 + UInt64(nameData.count)
-        var localHeaderBuffer = Data(count: Int(headerSize))
+        let localHeaderBuffer = localFileHeader(nameData: nameData, method: method, zip64: zip64)
+        try handle.write(contentsOf: localHeaderBuffer)
+        return UInt64(localHeaderBuffer.count)
+    }
+
+    static func requiresZIP64LocalHeader(size: UInt64, method: UInt16) -> Bool {
+        if size >= UInt64(UInt32.max) { return true }
+        // Reserve extended size fields before streaming if compressed output might reach the sentinel.
+        return method == 8 && compressBound(uLong(size)) >= UInt32.max
+    }
+
+    static func localFileHeader(nameData: Data, method: UInt16, zip64: Bool) -> Data {
+        let headerSize = 30 + nameData.count + (zip64 ? 20 : 0)
+        var localHeaderBuffer = Data(count: headerSize)
 
         localHeaderBuffer.withUnsafeMutableBytes { buffer in
             ZipBinaryBuffer.writeUInt32(ZipMagic.localHeader, into: buffer, offset: 0)
-            ZipBinaryBuffer.writeUInt16(20, into: buffer, offset: 4)     // Version needed to extract
+            ZipBinaryBuffer.writeUInt16(zip64 ? 45 : 20, into: buffer, offset: 4) // Version needed
             ZipBinaryBuffer.writeUInt16(0x0800, into: buffer, offset: 6)  // General purpose flags: Bit 11 = UTF-8
             ZipBinaryBuffer.writeUInt16(method, into: buffer, offset: 8)  // Compression method (0 or 8)
             ZipBinaryBuffer.writeUInt16(0, into: buffer, offset: 10)     // Last mod time
             ZipBinaryBuffer.writeUInt16(0, into: buffer, offset: 12)     // Last mod date
             ZipBinaryBuffer.writeUInt32(0, into: buffer, offset: 14)     // CRC-32 (placeholder)
-            ZipBinaryBuffer.writeUInt32(0, into: buffer, offset: 18)     // Compressed size (placeholder)
-            ZipBinaryBuffer.writeUInt32(0, into: buffer, offset: 22)     // Uncompressed size (placeholder)
+            ZipBinaryBuffer.writeUInt32(zip64 ? UInt32.max : 0, into: buffer, offset: 18)     // Compressed size (placeholder)
+            ZipBinaryBuffer.writeUInt32(zip64 ? UInt32.max : 0, into: buffer, offset: 22)     // Uncompressed size (placeholder)
             ZipBinaryBuffer.writeUInt16(UInt16(nameData.count), into: buffer, offset: 26)
-            ZipBinaryBuffer.writeUInt16(0, into: buffer, offset: 28)     // Extra field length
+            ZipBinaryBuffer.writeUInt16(zip64 ? 20 : 0, into: buffer, offset: 28)
+            if zip64 {
+                let extraOffset = 30 + nameData.count
+                ZipBinaryBuffer.writeUInt16(ZipMagic.zip64ExtraFieldTag, into: buffer, offset: extraOffset)
+                ZipBinaryBuffer.writeUInt16(16, into: buffer, offset: extraOffset + 2)
+            }
         }
 
         nameData.withUnsafeBytes { nameBuffer in
-            localHeaderBuffer.replaceSubrange(30..<Int(headerSize), with: nameBuffer)
+            localHeaderBuffer.replaceSubrange(30..<(30 + nameData.count), with: nameBuffer)
         }
 
-        try handle.write(contentsOf: localHeaderBuffer)
-        return headerSize
+        return localHeaderBuffer
     }
 
     /// Streams member data (either memory buffer or file descriptor) into the archive, computing CRC32.
     private static func streamPayload(
-        handle: FileHandle,
+        handle: Output,
         asset: ArchiveAsset,
         uncompressedSize: UInt64,
         method: UInt16,
@@ -233,6 +283,10 @@ struct ZipBinaryWriter {
             defer {
                 try? descriptor.close()
             }
+            let identity = try ArchiveFileIdentity(fileDescriptor: descriptor.rawValue)
+            guard UInt64(identity.bytes) == uncompressedSize else {
+                throw ArchiveFailure.invalidSource("Source size changed: \(asset.path)")
+            }
 
             if method == 8 {
                 crc = try ZipDeflateEngine.compress(
@@ -260,7 +314,9 @@ struct ZipBinaryWriter {
                     let toRead = Int(Swift.min(UInt64(limits.bufferBytes), uncompressedSize - readOffset))
                     let slice = UnsafeMutableRawBufferPointer(rebasing: chunkBuf[0..<toRead])
                     let bytesRead = try descriptor.read(fromAbsoluteOffset: Int64(readOffset), into: slice)
-                    guard bytesRead > 0 else { break }
+                    guard bytesRead > 0 else {
+                        throw ArchiveFailure.invalidSource("Truncated source: \(asset.path)")
+                    }
 
                     let readData = Data(bytes: slice.baseAddress!, count: bytesRead)
                     crc = ZipChecksum.update(current: crc, data: readData)
@@ -269,6 +325,9 @@ struct ZipBinaryWriter {
                     readOffset += UInt64(bytesRead)
                 }
             }
+            guard identity.matches(fileDescriptor: descriptor.rawValue), identity.matches(url: fileURL) else {
+                throw ArchiveFailure.invalidSource("Source changed during write: \(asset.path)")
+            }
         }
 
         return (payloadBytes, crc)
@@ -276,23 +335,34 @@ struct ZipBinaryWriter {
 
     /// Rewrites the local file header with final calculated CRC32 and byte sizes.
     private static func patchLocalFileHeader(
-        handle: FileHandle,
+        handle: Output,
         localHeaderOffset: UInt64,
         crc: UInt32,
         payloadBytes: UInt64,
         uncompressedSize: UInt64,
-        currentOffset: UInt64
+        currentOffset: UInt64,
+        nameLength: Int,
+        zip64: Bool
     ) throws {
         try handle.seek(toOffset: localHeaderOffset + 14)
 
         var patchBuffer = Data(count: 12)
         patchBuffer.withUnsafeMutableBytes { patchPtr in
             ZipBinaryBuffer.writeUInt32(crc, into: patchPtr, offset: 0)
-            ZipBinaryBuffer.writeUInt32(UInt32(Swift.min(payloadBytes, UInt64(UInt32.max))), into: patchPtr, offset: 4)
-            ZipBinaryBuffer.writeUInt32(UInt32(Swift.min(uncompressedSize, UInt64(UInt32.max))), into: patchPtr, offset: 8)
+            ZipBinaryBuffer.writeUInt32(zip64 ? UInt32.max : UInt32(payloadBytes), into: patchPtr, offset: 4)
+            ZipBinaryBuffer.writeUInt32(zip64 ? UInt32.max : UInt32(uncompressedSize), into: patchPtr, offset: 8)
         }
 
         try handle.write(contentsOf: patchBuffer)
+        if zip64 {
+            var sizes = Data(count: 16)
+            sizes.withUnsafeMutableBytes { buffer in
+                ZipBinaryBuffer.writeUInt64(uncompressedSize, into: buffer, offset: 0)
+                ZipBinaryBuffer.writeUInt64(payloadBytes, into: buffer, offset: 8)
+            }
+            try handle.seek(toOffset: localHeaderOffset + 30 + UInt64(nameLength) + 4)
+            try handle.write(contentsOf: sizes)
+        }
         try handle.seek(toOffset: currentOffset)
     }
 
@@ -300,50 +370,57 @@ struct ZipBinaryWriter {
     ///
     /// APPNOTE.TXT Section 4.3.12: 46 bytes fixed structure followed by member filename.
     private static func writeCentralDirectoryRecords(
-        handle: FileHandle,
+        handle: Output,
         entries: [WrittenEntry]
     ) throws -> UInt64 {
         var totalBytesWritten: UInt64 = 0
-
         for entry in entries {
-            let pathData = Data(entry.path.utf8)
-            let cdRecordSize = 46 + pathData.count
-            var cdBuffer = Data(count: cdRecordSize)
-
-            cdBuffer.withUnsafeMutableBytes { buffer in
-                ZipBinaryBuffer.writeUInt32(ZipMagic.centralDirectoryHeader, into: buffer, offset: 0)
-                ZipBinaryBuffer.writeUInt16(20, into: buffer, offset: 4)     // Version made by
-                ZipBinaryBuffer.writeUInt16(20, into: buffer, offset: 6)     // Version needed
-                ZipBinaryBuffer.writeUInt16(0x0800, into: buffer, offset: 8)  // Flags (Bit 11 = UTF-8)
-                ZipBinaryBuffer.writeUInt16(entry.compressionMethod, into: buffer, offset: 10)
-                ZipBinaryBuffer.writeUInt16(0, into: buffer, offset: 12)     // Mod time
-                ZipBinaryBuffer.writeUInt16(0, into: buffer, offset: 14)     // Mod date
-                ZipBinaryBuffer.writeUInt32(entry.crc32, into: buffer, offset: 16)
-                ZipBinaryBuffer.writeUInt32(UInt32(Swift.min(entry.compressedSize, UInt64(UInt32.max))), into: buffer, offset: 20)
-                ZipBinaryBuffer.writeUInt32(UInt32(Swift.min(entry.uncompressedSize, UInt64(UInt32.max))), into: buffer, offset: 24)
-                ZipBinaryBuffer.writeUInt16(UInt16(pathData.count), into: buffer, offset: 28)
-                ZipBinaryBuffer.writeUInt16(0, into: buffer, offset: 30)     // Extra field len
-                ZipBinaryBuffer.writeUInt16(0, into: buffer, offset: 32)     // Comment len
-                ZipBinaryBuffer.writeUInt16(0, into: buffer, offset: 34)     // Disk number start
-                ZipBinaryBuffer.writeUInt16(0, into: buffer, offset: 36)     // Internal attributes
-                ZipBinaryBuffer.writeUInt32(entry.isDirectory ? 0x10 : 0, into: buffer, offset: 38) // External attributes
-                ZipBinaryBuffer.writeUInt32(UInt32(Swift.min(entry.localHeaderOffset, UInt64(UInt32.max))), into: buffer, offset: 42)
-            }
-
-            pathData.withUnsafeBytes { nameBuffer in
-                cdBuffer.replaceSubrange(46..<cdRecordSize, with: nameBuffer)
-            }
-
-            try handle.write(contentsOf: cdBuffer)
-            totalBytesWritten += UInt64(cdRecordSize)
+            let record = centralDirectoryRecord(entry)
+            try handle.write(contentsOf: record)
+            totalBytesWritten += UInt64(record.count)
         }
-
         return totalBytesWritten
+    }
+
+    static func centralDirectoryRecord(_ entry: WrittenEntry) -> Data {
+        let pathData = Data(entry.path.utf8)
+        let expanded64 = entry.usesZIP64 || entry.uncompressedSize >= UInt64(UInt32.max)
+        let compressed64 = entry.usesZIP64 || entry.compressedSize >= UInt64(UInt32.max)
+        let offset64 = entry.localHeaderOffset >= UInt64(UInt32.max)
+        let valueCount = (expanded64 ? 1 : 0) + (compressed64 ? 1 : 0) + (offset64 ? 1 : 0)
+        let extraLength = valueCount == 0 ? 0 : 4 + valueCount * 8
+        var record = Data(count: 46 + pathData.count + extraLength)
+        record.withUnsafeMutableBytes { buffer in
+            ZipBinaryBuffer.writeUInt32(ZipMagic.centralDirectoryHeader, into: buffer, offset: 0)
+            ZipBinaryBuffer.writeUInt16(extraLength > 0 ? 45 : 20, into: buffer, offset: 4)
+            ZipBinaryBuffer.writeUInt16(extraLength > 0 ? 45 : 20, into: buffer, offset: 6)
+            ZipBinaryBuffer.writeUInt16(0x0800, into: buffer, offset: 8)
+            ZipBinaryBuffer.writeUInt16(entry.compressionMethod, into: buffer, offset: 10)
+            ZipBinaryBuffer.writeUInt32(entry.crc32, into: buffer, offset: 16)
+            ZipBinaryBuffer.writeUInt32(compressed64 ? UInt32.max : UInt32(entry.compressedSize), into: buffer, offset: 20)
+            ZipBinaryBuffer.writeUInt32(expanded64 ? UInt32.max : UInt32(entry.uncompressedSize), into: buffer, offset: 24)
+            ZipBinaryBuffer.writeUInt16(UInt16(pathData.count), into: buffer, offset: 28)
+            ZipBinaryBuffer.writeUInt16(UInt16(extraLength), into: buffer, offset: 30)
+            ZipBinaryBuffer.writeUInt32(entry.isDirectory ? 0x10 : 0, into: buffer, offset: 38)
+            ZipBinaryBuffer.writeUInt32(offset64 ? UInt32.max : UInt32(entry.localHeaderOffset), into: buffer, offset: 42)
+            if extraLength > 0 {
+                var offset = 46 + pathData.count
+                ZipBinaryBuffer.writeUInt16(ZipMagic.zip64ExtraFieldTag, into: buffer, offset: offset)
+                ZipBinaryBuffer.writeUInt16(UInt16(valueCount * 8), into: buffer, offset: offset + 2)
+                offset += 4
+                for (required, value) in [(expanded64, entry.uncompressedSize), (compressed64, entry.compressedSize), (offset64, entry.localHeaderOffset)] where required {
+                    ZipBinaryBuffer.writeUInt64(value, into: buffer, offset: offset)
+                    offset += 8
+                }
+            }
+        }
+        record.replaceSubrange(46..<(46 + pathData.count), with: pathData)
+        return record
     }
 
     /// Emits the ZIP64 End of Central Directory Record (56 bytes) and Locator (20 bytes).
     private static func writeZIP64EOCD(
-        handle: FileHandle,
+        handle: Output,
         entryCount: UInt64,
         centralDirectorySize: UInt64,
         centralDirectoryStartOffset: UInt64,
@@ -384,7 +461,7 @@ struct ZipBinaryWriter {
     ///
     /// APPNOTE.TXT Section 4.3.16: Fixed 22 bytes structure.
     private static func writeStandardEOCD(
-        handle: FileHandle,
+        handle: Output,
         entryCount: Int,
         centralDirectorySize: UInt64,
         centralDirectoryStartOffset: UInt64,

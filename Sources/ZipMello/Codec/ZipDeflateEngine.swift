@@ -51,13 +51,17 @@ enum ZipDeflateEngine {
         var streamFinished = false
 
         while !streamFinished {
+            try Task.checkCancellation()
             if strm.avail_in == 0 && readPosition < compressedBytes {
                 let remaining = compressedBytes - readPosition
                 let fetchCount = Int(Swift.min(UInt64(bufferBytes), remaining))
                 let chunk = try provider(readPosition, fetchCount)
-                if chunk.isEmpty { break }
+                guard !chunk.isEmpty, chunk.count <= fetchCount else {
+                    throw ArchiveFailure.invalidSource("Truncated or oversized codec input")
+                }
                 readPosition += UInt64(chunk.count)
                 currentInputChunk = chunk
+                strm.avail_in = uInt(chunk.count)
             }
 
             guard let inputChunk = currentInputChunk, !inputChunk.isEmpty else {
@@ -74,12 +78,8 @@ enum ZipDeflateEngine {
                 let bytePtr = baseAddr.assumingMemoryBound(to: Bytef.self)
                 let offset = inputChunk.count - Int(strm.avail_in)
 
-                if strm.avail_in == 0 {
-                    strm.next_in = UnsafeMutablePointer(mutating: bytePtr)
-                    strm.avail_in = uInt(inputChunk.count)
-                } else {
-                    strm.next_in = UnsafeMutablePointer(mutating: bytePtr.advanced(by: offset))
-                }
+                strm.next_in = UnsafeMutablePointer(mutating: bytePtr.advanced(by: offset))
+                let inputBefore = strm.avail_in
 
                 strm.next_out = outBuffer
                 strm.avail_out = uInt(bufferBytes)
@@ -100,25 +100,27 @@ enum ZipDeflateEngine {
 
                 if res == Z_STREAM_END {
                     streamFinished = true
-                    return
+                } else if produced == 0 && strm.avail_in == inputBefore {
+                    throw ArchiveFailure.invalidSource("Incomplete DEFLATE stream")
                 }
-            }
-
-            if streamFinished { break }
-
-            if strm.avail_in == 0 && readPosition >= compressedBytes {
-                break
             }
         }
 
+        guard streamFinished else {
+            throw ArchiveFailure.invalidSource("Incomplete DEFLATE stream")
+        }
         return crc
     }
 
     /// Decompresses an entire raw DEFLATE buffer in a single pass into a pre-allocated destination buffer.
     static func decompressWholeBuffer(
         compressed: Data,
-        destination: UnsafeMutableRawBufferPointer
+        destination: UnsafeMutableRawBufferPointer,
+        path: String = ""
     ) throws -> UInt32 {
+        guard compressed.count <= Int(uInt.max), destination.count <= Int(uInt.max) else {
+            throw ArchiveFailure.invalidLimits
+        }
         var strm = z_stream()
         let initResult = inflateInit2_(&strm, -15, ZLIB_VERSION, Int32(MemoryLayout<z_stream>.size))
         guard initResult == Z_OK else {
@@ -129,8 +131,9 @@ enum ZipDeflateEngine {
         }
 
         return try compressed.withUnsafeBytes { srcBuf in
-            guard let srcBase = srcBuf.baseAddress, let dstBase = destination.baseAddress else {
-                return 0
+            guard let srcBase = srcBuf.baseAddress, !srcBuf.isEmpty,
+                  let dstBase = destination.baseAddress, !destination.isEmpty else {
+                throw ArchiveFailure.invalidSource("Empty DEFLATE input or destination")
             }
             strm.next_in = UnsafeMutablePointer(mutating: srcBase.assumingMemoryBound(to: Bytef.self))
             strm.avail_in = uInt(srcBuf.count)
@@ -140,6 +143,9 @@ enum ZipDeflateEngine {
             let res = inflate(&strm, Z_FINISH)
             guard res == Z_STREAM_END else {
                 throw ArchiveFailure.invalidSource("zlib inflate error \(res)")
+            }
+            guard strm.total_out == destination.count else {
+                throw ArchiveFailure.sizeMismatch(path)
             }
             return ZipChecksum.update(current: 0, buffer: UnsafeRawBufferPointer(destination))
         }
@@ -192,11 +198,14 @@ enum ZipDeflateEngine {
         var streamFinished = false
 
         while !streamFinished {
+            try Task.checkCancellation()
             if strm.avail_in == 0 && readPosition < uncompressedBytes {
                 let remaining = uncompressedBytes - readPosition
                 let fetchCount = Int(Swift.min(UInt64(bufferBytes), remaining))
                 let chunk = try provider(readPosition, fetchCount)
-                if chunk.isEmpty { break }
+                guard !chunk.isEmpty, chunk.count <= fetchCount else {
+                    throw ArchiveFailure.invalidSource("Truncated or oversized codec input")
+                }
                 readPosition += UInt64(chunk.count)
                 crc = ZipChecksum.update(current: crc, data: chunk)
                 currentInputChunk = chunk
@@ -251,6 +260,7 @@ enum ZipDeflateEngine {
                 }
 
                 if res == Z_STREAM_END {
+                    streamFinished = true
                     break
                 }
             }
@@ -260,6 +270,9 @@ enum ZipDeflateEngine {
             }
         }
 
+        guard streamFinished, readPosition == uncompressedBytes else {
+            throw ArchiveFailure.invalidSource("Incomplete compression input")
+        }
         return crc
     }
 }

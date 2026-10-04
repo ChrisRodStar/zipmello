@@ -13,8 +13,8 @@ enum ZipMagic {
 
 /// Parsed End of Central Directory (EOCD) information.
 struct ZipEOCD: Sendable {
-    let diskNumber: UInt16
-    let startDisk: UInt16
+    let diskNumber: UInt32
+    let startDisk: UInt32
     let diskEntries: UInt64
     let totalEntries: UInt64
     let centralDirectorySize: UInt64

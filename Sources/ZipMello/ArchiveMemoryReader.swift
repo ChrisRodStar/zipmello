@@ -9,7 +9,7 @@ import Dispatch
 public struct ArchiveMemoryReader: Sendable {
     private let validated: ValidatedArchiveIndex
     private let worker: ArchiveReadWorker
-    private let lookup: ArchiveLookup
+    private let aliases: ArchiveAliasIndex?
 
     /// Initializes an in-memory archive reader by validating the central directory.
     ///
@@ -32,7 +32,7 @@ public struct ArchiveMemoryReader: Sendable {
             throw ArchiveFailure.archiveTooLarge
         }
 
-        let parser = try ZipCentralDirectoryParser.parse(input: .bytes(data))
+        let parser = try ZipCentralDirectoryParser.parse(input: .bytes(data), limits: limits)
         validated = try ValidatedArchiveIndex(
             parser: parser,
             input: .bytes(data),
@@ -40,7 +40,7 @@ public struct ArchiveMemoryReader: Sendable {
             limits: limits
         )
         worker = ArchiveReadWorker(input: .bytes(data), limits: limits, tuning: tuning)
-        self.lookup = lookup
+        aliases = lookup == .compatible ? try ArchiveAliasIndex(members: validated.members) : nil
     }
 
     /// Returns the verified manifest of entries contained within the in-memory archive.
@@ -56,27 +56,7 @@ public struct ArchiveMemoryReader: Sendable {
     public func read(_ path: String) throws -> Data {
         try Task.checkCancellation()
 
-        var resolvedPath = path
-        if validated.index[path] == nil, lookup == .compatible {
-            let key = ArchivePath.alias(try ArchivePath.canonical(path))
-            var singleMatch: String?
-
-            for member in validated.members where !member.isDirectory {
-                let canonical = try ArchivePath.canonical(member.path)
-                let decoded = canonical.removingPercentEncoding
-                let decodedMatch = decoded.map {
-                    (try? ArchivePath.validate($0)) != nil && ArchivePath.alias($0) == key
-                } ?? false
-
-                if ArchivePath.alias(canonical) == key || decodedMatch {
-                    guard singleMatch == nil else {
-                        throw ArchiveFailure.ambiguousEntry(path)
-                    }
-                    singleMatch = member.path
-                }
-            }
-            resolvedPath = singleMatch ?? path
-        }
+        let resolvedPath = validated.index[path] != nil ? path : try aliases?.resolve(path) ?? path
 
         guard let entry = validated.index[resolvedPath] else {
             throw ArchiveFailure.missingEntry(path)

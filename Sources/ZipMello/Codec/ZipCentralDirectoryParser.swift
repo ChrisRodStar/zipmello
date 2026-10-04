@@ -17,8 +17,12 @@ struct ZipCentralDirectoryParser: Sendable {
     /// - Parameter input: Binary archive input stream.
     /// - Returns: Complete parser containing the resolved EOCD and validated central entries.
     /// - Throws: `ArchiveFailure` if the archive is truncated, missing EOCD, or structurally malformed.
-    static func parse(input: ArchiveInput) throws -> ZipCentralDirectoryParser {
+    static func parse(input: ArchiveInput, limits: ArchiveLimits = .init()) throws -> ZipCentralDirectoryParser {
+        try limits.validate()
         let totalBytes = input.count
+        guard totalBytes <= limits.maximumArchiveBytes else {
+            throw ArchiveFailure.archiveTooLarge
+        }
         guard totalBytes >= 22 else {
             throw ArchiveFailure.invalidSource("Archive size too small for ZIP header")
         }
@@ -40,6 +44,18 @@ struct ZipCentralDirectoryParser: Sendable {
             throw ArchiveFailure.invalidSource("Central directory offset extends beyond archive")
         }
 
+        guard finalEOCD.diskNumber == 0, finalEOCD.startDisk == 0,
+              finalEOCD.diskEntries == finalEOCD.totalEntries else {
+            throw ArchiveFailure.invalidSource("Multi-disk archives are unsupported")
+        }
+        guard finalEOCD.totalEntries <= UInt64(limits.maximumEntries) else {
+            throw ArchiveFailure.tooManyEntries
+        }
+        guard finalEOCD.centralDirectorySize <= UInt64(Int.max),
+              finalEOCD.totalEntries <= finalEOCD.centralDirectorySize / 46 else {
+            throw ArchiveFailure.invalidSource("Incomplete directory")
+        }
+
         let cdData = try input.read(
             offset: finalEOCD.centralDirectoryOffset,
             count: Int(finalEOCD.centralDirectorySize)
@@ -54,6 +70,10 @@ struct ZipCentralDirectoryParser: Sendable {
                 let magic = ZipBinaryBuffer.readUInt32(from: buffer, offset: offset)
                 guard magic == ZipMagic.centralDirectoryHeader else { break }
 
+                try Task.checkCancellation()
+                guard entries.count < limits.maximumEntries else {
+                    throw ArchiveFailure.tooManyEntries
+                }
                 let (entry, recordLength) = try parseCentralDirectoryRecord(buffer: buffer, offset: offset)
                 entries.append(entry)
                 offset += recordLength
@@ -138,8 +158,8 @@ struct ZipCentralDirectoryParser: Sendable {
             let commentLen = ZipBinaryBuffer.readUInt16(from: buffer, offset: eocdOffsetInTail + 20)
 
             return ZipEOCD(
-                diskNumber: diskNum,
-                startDisk: startDisk,
+                diskNumber: UInt32(diskNum),
+                startDisk: UInt32(startDisk),
                 diskEntries: diskEntries,
                 totalEntries: totalEntries,
                 centralDirectorySize: cdSize,
@@ -189,16 +209,16 @@ struct ZipCentralDirectoryParser: Sendable {
                 return standardEOCD
             }
 
-            let diskNum = ZipBinaryBuffer.readUInt16(from: buffer, offset: 16)
-            let startDisk = ZipBinaryBuffer.readUInt16(from: buffer, offset: 20)
+            let diskNum = ZipBinaryBuffer.readUInt32(from: buffer, offset: 16)
+            let startDisk = ZipBinaryBuffer.readUInt32(from: buffer, offset: 20)
             let diskEntries = ZipBinaryBuffer.readUInt64(from: buffer, offset: 24)
             let totalEntries = ZipBinaryBuffer.readUInt64(from: buffer, offset: 32)
             let cdSize = ZipBinaryBuffer.readUInt64(from: buffer, offset: 40)
             let cdOffset = ZipBinaryBuffer.readUInt64(from: buffer, offset: 48)
 
             return ZipEOCD(
-                diskNumber: diskNum,
-                startDisk: startDisk,
+                diskNumber: UInt32(diskNum),
+                startDisk: UInt32(startDisk),
                 diskEntries: diskEntries,
                 totalEntries: totalEntries,
                 centralDirectorySize: cdSize,
@@ -227,7 +247,7 @@ struct ZipCentralDirectoryParser: Sendable {
         let nameLen = Int(ZipBinaryBuffer.readUInt16(from: buffer, offset: offset + 28))
         let extraLen = Int(ZipBinaryBuffer.readUInt16(from: buffer, offset: offset + 30))
         let commentLen = Int(ZipBinaryBuffer.readUInt16(from: buffer, offset: offset + 32))
-        let diskStart = ZipBinaryBuffer.readUInt32(from: buffer, offset: offset + 34)
+        var diskStart = UInt32(ZipBinaryBuffer.readUInt16(from: buffer, offset: offset + 34))
         let intAttrs = ZipBinaryBuffer.readUInt16(from: buffer, offset: offset + 36)
         let extAttrs = ZipBinaryBuffer.readUInt32(from: buffer, offset: offset + 38)
         var localOffset = UInt64(ZipBinaryBuffer.readUInt32(from: buffer, offset: offset + 42))
@@ -243,26 +263,48 @@ struct ZipCentralDirectoryParser: Sendable {
         // APPNOTE.TXT Section 4.5.3: ZIP64 Extended Information Extra Field (tag 0x0001).
         let extraOffset = offset + 46 + nameLen
         var extraIdx = 0
-        while extraIdx + 4 <= extraLen {
+        var zip64Seen = false
+        while extraIdx < extraLen {
+            guard extraLen - extraIdx >= 4 else {
+                throw ArchiveFailure.invalidSource("Truncated extra field for \(pathStr)")
+            }
             let tag = ZipBinaryBuffer.readUInt16(from: buffer, offset: extraOffset + extraIdx)
             let size = Int(ZipBinaryBuffer.readUInt16(from: buffer, offset: extraOffset + extraIdx + 2))
+            guard size <= extraLen - extraIdx - 4 else {
+                throw ArchiveFailure.invalidSource("Truncated extra field for \(pathStr)")
+            }
             if tag == ZipMagic.zip64ExtraFieldTag {
+                guard !zip64Seen else {
+                    throw ArchiveFailure.invalidSource("Duplicate ZIP64 extra field")
+                }
+                zip64Seen = true
                 var fieldPos = extraOffset + extraIdx + 4
                 let fieldEnd = fieldPos + size
-                if uncompSize == 0xFFFFFFFF && fieldPos + 8 <= fieldEnd {
-                    uncompSize = ZipBinaryBuffer.readUInt64(from: buffer, offset: fieldPos)
+                func readSize() throws -> UInt64 {
+                    guard fieldEnd - fieldPos >= 8 else {
+                        throw ArchiveFailure.invalidSource("Missing ZIP64 value for \(pathStr)")
+                    }
+                    let value = ZipBinaryBuffer.readUInt64(from: buffer, offset: fieldPos)
                     fieldPos += 8
+                    return value
                 }
-                if compSize == 0xFFFFFFFF && fieldPos + 8 <= fieldEnd {
-                    compSize = ZipBinaryBuffer.readUInt64(from: buffer, offset: fieldPos)
-                    fieldPos += 8
+                if uncompSize == 0xFFFFFFFF { uncompSize = try readSize() }
+                if compSize == 0xFFFFFFFF { compSize = try readSize() }
+                if localOffset == 0xFFFFFFFF { localOffset = try readSize() }
+                if diskStart == 0xFFFF {
+                    guard fieldEnd - fieldPos >= 4 else {
+                        throw ArchiveFailure.invalidSource("Missing ZIP64 disk number")
+                    }
+                    diskStart = ZipBinaryBuffer.readUInt32(from: buffer, offset: fieldPos)
                 }
-                if localOffset == 0xFFFFFFFF && fieldPos + 8 <= fieldEnd {
-                    localOffset = ZipBinaryBuffer.readUInt64(from: buffer, offset: fieldPos)
-                }
-                break
             }
             extraIdx += 4 + size
+        }
+        guard zip64Seen || (uncompSize != 0xFFFFFFFF && compSize != 0xFFFFFFFF && localOffset != 0xFFFFFFFF && diskStart != 0xFFFF) else {
+            throw ArchiveFailure.invalidSource("Missing ZIP64 extra field for \(pathStr)")
+        }
+        guard diskStart == 0 else {
+            throw ArchiveFailure.invalidSource("Multi-disk archives are unsupported")
         }
 
         let posixMode = (extAttrs >> 16) & 0xF000

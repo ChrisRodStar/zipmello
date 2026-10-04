@@ -204,12 +204,11 @@ struct ArchiveReadWorker: Sendable {
 
         if entry.compression == .deflate,
            tuning.wholeBufferDeflateLimit > 0,
-           entry.expandedBytes <= UInt64(tuning.wholeBufferDeflateLimit) {
+           entry.expandedBytes <= UInt64(tuning.wholeBufferDeflateLimit),
+           entry.compressedBytes <= UInt64(tuning.wholeBufferDeflateLimit) {
             let count = Int(entry.expandedBytes)
             if count == 0 {
-                guard entry.checksum == 0 else {
-                    throw ArchiveFailure.checksumMismatch(path)
-                }
+                try consume(entry, path: path) { _ in }
                 return Data()
             }
 
@@ -222,7 +221,8 @@ struct ArchiveReadWorker: Sendable {
                 let dstBuffer = UnsafeMutableRawBufferPointer(start: storage, count: count)
                 let calculatedCRC = try ZipDeflateEngine.decompressWholeBuffer(
                     compressed: compressed,
-                    destination: dstBuffer
+                    destination: dstBuffer,
+                    path: path
                 )
                 guard calculatedCRC == entry.checksum else {
                     throw ArchiveFailure.checksumMismatch(path)
@@ -393,9 +393,7 @@ public actor ArchiveReader {
     private var members: [ArchiveMember] = []
     private var lanes: [ArchiveReadLane] = []
     private var nextLane = 0
-    private var aliases: [String: String] = [:]
-    private var ambiguousAliases: Set<String> = []
-    private var aliasesReady = false
+    private var aliases: ArchiveAliasIndex?
     private var worker: ArchiveReadWorker?
     private var inlineWorker: ArchiveReadWorker?
     private let limits: ArchiveLimits
@@ -429,7 +427,7 @@ public actor ArchiveReader {
             throw ArchiveFailure.archiveTooLarge
         }
         try file.validateIdentity(at: url)
-        let parser = try ZipCentralDirectoryParser.parse(input: .file(file))
+        let parser = try ZipCentralDirectoryParser.parse(input: .file(file), limits: limits)
         try loadIndex(parser, input: .file(file))
         try file.validateIdentity(at: url)
     }
@@ -452,7 +450,7 @@ public actor ArchiveReader {
 
     private func load(_ data: Data) throws {
         try Task.checkCancellation()
-        let parser = try ZipCentralDirectoryParser.parse(input: .bytes(data))
+        let parser = try ZipCentralDirectoryParser.parse(input: .bytes(data), limits: limits)
         try loadIndex(parser, input: .bytes(data))
     }
 
@@ -595,30 +593,10 @@ public actor ArchiveReader {
             return path
         }
 
-        if !aliasesReady {
-            for member in members where !member.isDirectory {
-                let canonical = try ArchivePath.canonical(member.path)
-                var keys = [ArchivePath.alias(canonical)]
-                if let decoded = canonical.removingPercentEncoding,
-                   (try? ArchivePath.validate(decoded)) != nil {
-                    keys.append(ArchivePath.alias(decoded))
-                }
-                for key in keys {
-                    if let existing = aliases[key], existing != member.path {
-                        ambiguousAliases.insert(key)
-                    } else {
-                        aliases[key] = member.path
-                    }
-                }
-            }
-            aliasesReady = true
+        if aliases == nil {
+            aliases = try ArchiveAliasIndex(members: members)
         }
-
-        let key = ArchivePath.alias(try ArchivePath.canonical(path))
-        guard !ambiguousAliases.contains(key) else {
-            throw ArchiveFailure.ambiguousEntry(path)
-        }
-        return aliases[key] ?? path
+        return try aliases!.resolve(path)
     }
 
     /// Extracts all entries into a destination directory using an atomic staging tree.
@@ -729,8 +707,6 @@ public actor ArchiveReader {
         lanes.removeAll()
         index.removeAll()
         members.removeAll()
-        aliases.removeAll()
-        ambiguousAliases.removeAll()
-        aliasesReady = false
+        aliases = nil
     }
 }
